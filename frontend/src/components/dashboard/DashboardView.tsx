@@ -1,0 +1,368 @@
+import * as React from "react";
+import DocumentTile from "@/components/documents/DocumentTile";
+import FrameCard from "@/components/surface/FrameCard";
+import { Button } from "@/components/ui/button";
+import { ExtColors, GalleryItem } from "@/types/ui";
+import api from "@/lib/api";
+import { ImageGenModal } from "@/components/modals/ImageGenModal";
+import { ImagePlus, X } from "lucide-react";
+import TileShell from "@/components/surface/TileShell";
+
+import GalleryPreviewTile from "@/components/gallery/PreviewTile";
+
+// Debug signature: helps confirm which DashboardView module the browser is actually running.
+const DASHBOARDVIEW_SIGNATURE = "DashboardView.tsx (components/dashboard) signature: 2026-02-01";
+
+// ──────── Demo Data ────────
+const DEMO_RECENT_DOCS: string[] = [
+  "Codexify Design Tokens.pdf",
+  "UI Architecture Guide.md",
+  "Integration Roadmap.doc",
+];
+
+const DEMO_GALLERY_ITEMS: GalleryItem[] = [
+  {
+    src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cdefs%3E%3ClinearGradient id='g1' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' style='stop-color:%23ff6b6b;stop-opacity:1' /%3E%3Cstop offset='100%25' style='stop-color:%23ee5a6f;stop-opacity:1' /%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='256' height='256' fill='url(%23g1)'/%3E%3C/svg%3E",
+    prompt: "Demo: Warm Gradient",
+  },
+  {
+    src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cdefs%3E%3ClinearGradient id='g2' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' style='stop-color:%234c2a7d;stop-opacity:1' /%3E%3Cstop offset='100%25' style='stop-color:%236d28d9;stop-opacity:1' /%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='256' height='256' fill='url(%23g2)'/%3E%3C/svg%3E",
+    prompt: "Demo: Deep Purple",
+  },
+  {
+    src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cdefs%3E%3ClinearGradient id='g3' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' style='stop-color:%2360a5fa;stop-opacity:1' /%3E%3Cstop offset='100%25' style='stop-color:%233b82f6;stop-opacity:1' /%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='256' height='256' fill='url(%23g3)'/%3E%3C/svg%3E",
+    prompt: "Demo: Cool Blue",
+  },
+  {
+    src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cdefs%3E%3ClinearGradient id='g4' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' style='stop-color:%2310b981;stop-opacity:1' /%3E%3Cstop offset='100%25' style='stop-color:%23059669;stop-opacity:1' /%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='256' height='256' fill='url(%23g4)'/%3E%3C/svg%3E",
+    prompt: "Demo: Fresh Green",
+  },
+];
+
+type DashboardViewProps = {
+  extColors: ExtColors;
+  gallery: GalleryItem[];
+  onImagePrompt: (p: string) => void;
+  onRequestNewProject: () => void;
+  onRequestNewThread: () => void;
+  onNavigateDocuments: () => void;
+  onNavigateGallery: () => void;
+  threadGridRows: number;
+};
+
+export default function DashboardView({
+  extColors: _extColors,
+  gallery,
+  onImagePrompt,
+  onRequestNewProject,
+  onRequestNewThread,
+  onNavigateDocuments,
+  onNavigateGallery,
+  threadGridRows,
+}: DashboardViewProps) {
+  const [pinnedThreads, setPinnedThreads] = React.useState<
+    { id: string; title: string; lastMessage?: string; archivedAt?: string | null }[]
+  >([]);
+  const [showImgGen, setShowImgGen] = React.useState(false);
+  const [recentDocs, setRecentDocs] = React.useState<string[]>([]);
+  const [showDemoDocs, setShowDemoDocs] = React.useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    return window.localStorage.getItem("cfy.hideMockDocs") !== "1";
+  });
+  const [showDemoGallery, setShowDemoGallery] = React.useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    return window.localStorage.getItem("cfy.hideMockGallery") !== "1";
+  });
+
+  React.useEffect(() => {
+    try {
+      console.debug("[dashboard]", DASHBOARDVIEW_SIGNATURE);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.get("/chat/threads");
+        const raw = (res?.data && (Array.isArray(res.data) ? res.data : res.data.threads)) || [];
+        const mapped = (raw || [])
+          .map((r: any) => ({
+            id: String(r.id ?? r.thread_id ?? r.threadId),
+            title: r.title ?? r.summary ?? "Untitled Chat",
+            lastMessage: r.lastMessage ?? r.last_message ?? "",
+            archivedAt: r.archived_at ?? r.archivedAt ?? null,
+          }))
+          .filter((t: any) => t.id && !t.archivedAt);
+        if (!cancelled) setPinnedThreads(mapped);
+      } catch (e) {
+        console.warn("[dashboard] failed to load threads", e);
+        if (!cancelled) setPinnedThreads([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Load recent documents from API (PCX_UI_QUIKWINS_002)
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        // NOTE: `api` is configured with the `/api` base; keep paths base-relative.
+        // Backend route: GET /api/media/documents
+        const res = await api.get("/media/documents", { params: { limit: 4 } });
+        const data = res?.data;
+
+        // Backend may return either:
+        //  - an array of docs
+        //  - an envelope like { documents: [...], count: number }
+        //  - an envelope like { items: [...] } or { data: [...] }
+        //  - an error object (e.g. { detail: [...] })
+        //  - a nested envelope (proxy / wrapper)
+        const unwrap = (v: any): any => {
+          if (!v || typeof v !== "object") return v;
+          return (v as any).documents ?? (v as any).items ?? (v as any).data ?? (v as any).results ?? v;
+        };
+
+        const candidate1 = Array.isArray(data) ? data : unwrap(data);
+        const candidate2 = Array.isArray(candidate1) ? candidate1 : unwrap(candidate1);
+        const docs: any[] = Array.isArray(candidate2) ? candidate2 : [];
+
+        // Optional debug signal: helps identify weird backend shapes without crashing UI
+        if (docs.length === 0 && data != null) {
+          try {
+            console.debug("[dashboard] documents payload shape", {
+              type: typeof data,
+              keys: typeof data === "object" && data ? Object.keys(data as any) : undefined,
+            });
+          } catch {
+            // ignore
+          }
+        }
+
+        const names = docs
+          .map((d: any) => d?.filename || d?.name || d?.title || "Untitled")
+          .filter((v: any) => typeof v === "string" && v.trim().length > 0);
+
+        if (!cancelled) setRecentDocs(Array.isArray(names) ? names : []);
+      } catch (e) {
+        console.warn("[dashboard] failed to load documents", e);
+        // Fall back to empty array (dashboard will show demo docs if enabled)
+        if (!cancelled) setRecentDocs([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const openThread = (id: string) => {
+    if (typeof window !== "undefined") {
+      const url = `/chat/${id}`;
+      try {
+        window.history.pushState({}, "", url);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      } catch {
+        window.location.href = url;
+      }
+    }
+  };
+
+  const rows = Math.max(1, Number.isFinite(threadGridRows) ? threadGridRows : 2);
+  const threadColumns = 2;
+  const threadLimit = threadColumns * rows;
+  const threadList = pinnedThreads.slice(0, threadLimit);
+
+  // Compute which docs and gallery items to show
+  const hasRealDocs = recentDocs && recentDocs.length > 0;
+  const docsToRender = hasRealDocs ? recentDocs : showDemoDocs ? DEMO_RECENT_DOCS : [];
+
+  const hasRealGallery = gallery && gallery.length > 0;
+  const galleryToRender = React.useMemo(
+    () => (hasRealGallery ? gallery.slice(0, 12) : showDemoGallery ? DEMO_GALLERY_ITEMS : []),
+    [gallery, hasRealGallery, showDemoGallery]
+  );
+
+  return (
+    <section className="flex h-full w-full min-h-0 flex-col">
+      <div className="flex-1 min-h-0 p-[var(--board-edge)]">
+        <div className="flex h-full min-h-0 gap-[var(--gutter)]">
+          <div className="flex min-h-0 flex-1 flex-col gap-[var(--gutter)]">
+            <FrameCard
+              refractiveFallback
+              shimmerMode="subtle"
+              className="flex-1 min-h-[260px]"
+            >
+              <div className="flex h-full min-h-0 flex-col p-5 gap-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-semibold tracking-tight">Recent Threads</h2>
+                    <p className="text-xs opacity-70">Jump back into a conversation or spin up something new.</p>
+                  </div>
+                  <div className="glass-pill h-auto py-[3px] px-[6px]">
+                    <button
+                      type="button"
+                      className="pill-tab text-xs"
+                      data-state="active"
+                      onClick={onRequestNewThread}
+                      aria-label="Create new thread"
+                    >
+                      New Thread
+                    </button>
+                    <button
+                      type="button"
+                      className="pill-tab text-xs"
+                      onClick={onRequestNewProject}
+                      aria-label="Create new project"
+                    >
+                      New Project
+                    </button>
+                  </div>
+                </div>
+                <div className="relative flex-1 min-h-0">
+                  {threadList.length === 0 ? (
+                    <div className="flex h-full items-center justify-center text-sm opacity-70">
+                      No threads yet. Start one above.
+                    </div>
+                  ) : (
+                    <div className="grid h-full grid-cols-2 gap-[var(--gutter)]">
+                      {threadList.map((t) => (
+                        <TileShell
+                          key={t.id}
+                          as="button"
+                          type="button"
+                          className="flex h-full w-full flex-col justify-between gap-3 px-4 py-4 text-left transition-transform duration-150 ease-out hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-strong)]"
+                          style={{
+                            background:
+                              "color-mix(in oklab,var(--panel-sheet,rgba(12,19,32,0.78)) 96%,transparent)",
+                            borderColor: "color-mix(in oklab,var(--panel-border) 85%,transparent)",
+                          }}
+                          onClick={() => openThread(t.id)}
+                        >
+                          <span className="text-base font-semibold truncate">{t.title}</span>
+                          {t.lastMessage ? (
+                            <span className="text-xs opacity-70 truncate">{t.lastMessage}</span>
+                          ) : (
+                            <span className="text-xs italic opacity-50">No replies yet</span>
+                          )}
+                        </TileShell>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </FrameCard>
+
+            <FrameCard
+              refractiveFallback
+              shimmerMode="subtle"
+              className="flex-1 min-h-[240px]"
+            >
+              <div className="flex h-full min-h-0 flex-col p-5 gap-4">
+                <div className="flex items-center justify-between gap-3">
+                  <h2 className="text-lg font-semibold tracking-tight">Recent Documents</h2>
+                  <Button type="button" variant="ghost" size="sm" onClick={onNavigateDocuments}>
+                    See All
+                  </Button>
+                </div>
+                {!hasRealDocs && showDemoDocs && (
+                  <div className="rounded-[var(--tile-radius)] bg-[color-mix(in oklab,var(--panel-bg) 95%,transparent)] border border-[var(--panel-border)] p-3 flex items-center justify-between gap-3">
+                    <p className="text-xs opacity-75">Demo documents. Create or upload to replace.</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowDemoDocs(false);
+                        window.localStorage.setItem("cfy.hideMockDocs", "1");
+                      }}
+                      className="flex-shrink-0 opacity-60 hover:opacity-100 transition-opacity"
+                      aria-label="Dismiss demo documents"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
+                <div className="flex-1 min-h-0 overflow-hidden">
+                  {docsToRender.length === 0 ? (
+                    <div className="flex h-full items-center justify-center text-sm opacity-70">
+                      No documents yet. Create or upload to get started.
+                    </div>
+                  ) : (
+                    <div className="grid h-full grid-cols-[repeat(auto-fill,minmax(125px,1fr))] gap-[var(--gutter)] justify-items-center">
+                      {docsToRender.map((d) => (
+                        <DocumentTile
+                          key={d}
+                          file={{ name: d }}
+                          className="dashboard-doc-tile focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-strong)] focus-visible:ring-offset-2"
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </FrameCard>
+          </div>
+
+          <FrameCard
+            refractiveFallback
+            shimmerMode="subtle"
+            className="flex-[1.15] min-h-0"
+          >
+            <div className="flex h-full min-h-0 flex-col p-5 gap-4">
+              <div className="flex items-center justify-between gap-3">
+                <h2 className="text-lg font-semibold tracking-tight">Gallery</h2>
+                <div className="flex items-center gap-2">
+                  <Button type="button" variant="ghost" size="sm" onClick={() => setShowImgGen(true)}>
+                    <ImagePlus className="h-4 w-4 mr-1" />
+                    Generate
+                  </Button>
+                  <Button type="button" variant="ghost" size="sm" onClick={onNavigateGallery}>
+                    See All
+                  </Button>
+                </div>
+              </div>
+              {!hasRealGallery && showDemoGallery && (
+                <div className="rounded-[var(--tile-radius)] bg-[color-mix(in oklab,var(--panel-bg) 95%,transparent)] border border-[var(--panel-border)] p-3 flex items-center justify-between gap-3">
+                  <p className="text-xs opacity-75">Demo gallery images. They'll disappear once you add your own.</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowDemoGallery(false);
+                      window.localStorage.setItem("cfy.hideMockGallery", "1");
+                    }}
+                    className="flex-shrink-0 opacity-60 hover:opacity-100 transition-opacity"
+                    aria-label="Dismiss demo gallery"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              )}
+              <div className="flex-1 min-h-0 overflow-hidden">
+                {galleryToRender.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-sm opacity-70">
+                    No gallery images yet. Generate or upload to get started.
+                  </div>
+                ) : (
+                  <div className="grid h-full grid-cols-[repeat(auto-fill,minmax(125px,1fr))] gap-[var(--gutter)]">
+                    {galleryToRender.map((item, index) => (
+                      <GalleryPreviewTile
+                        key={`${item.src}-${index}`}
+                        src={item.src}
+                        alt={item.prompt || "Gallery image"}
+                        onClick={() => onImagePrompt(item.prompt)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </FrameCard>
+        </div>
+      </div>
+      <ImageGenModal open={showImgGen} onOpenChange={setShowImgGen} />
+    </section>
+  );
+}
