@@ -13,6 +13,7 @@ import { Composer } from "./components";
 import ChatView from "@/features/chat/ChatView";
 import useChat from "@/features/chat/useChat";
 import api from "@/lib/api";
+import { GUARDIAN_API_KEY } from "@/lib/env";
 import { useLiveEvents } from "@/hooks/useLiveEvents";
 import FrameCard from "@/components/surface/FrameCard";
 import { setTrace } from "@/state/contextTrace";
@@ -146,18 +147,37 @@ export function GuardianChat({
   // Helper: ask backend to complete the thread and then refresh
   const completeThread = async (tid: number) => {
     try {
-      const response = await api.post(`/chat/${tid}/complete`, { depth_mode: depth });
+      // Use fetch directly for completion to avoid axios/Object.keys crash in some environments.
+      const response = await fetch(`/api/chat/${tid}/complete`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(GUARDIAN_API_KEY ? { "X-API-Key": GUARDIAN_API_KEY } : {}),
+        },
+        body: JSON.stringify({ depth_mode: depth }),
+      });
+      if (response.status === 404) {
+        // Route can hold a stale thread id; force sidebar refresh and create/select a valid thread.
+        emitThreadsRefresh("refresh", { reason: "missing-thread", id: String(tid) });
+        onNewChat();
+        throw new Error("complete failed: 404 thread_not_found");
+      }
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`complete failed: ${response.status}${detail ? ` ${detail}` : ""}`);
+      }
+      const responseData = await response.json().catch(() => ({}));
       console.log(`[guardian] Completing with depth=${depth}`);
 
       // Capture task_id for completion state tracking
-      const taskId = response?.data?.task_id;
+      const taskId = (responseData as any)?.task_id;
       if (taskId) {
         console.debug(`[guardian] Starting completion tracking: task=${taskId}`);
         startCompletion(tid, taskId);
       }
 
       // Capture RAG trace for diagnostics/memory browser
-      const ctx = response?.data?.context;
+      const ctx = (responseData as any)?.context;
       if (ctx) {
         setTrace({
           semantic: ctx.semantic || [],
@@ -179,6 +199,9 @@ export function GuardianChat({
   };
 
   const numericThreadId = useMemo(() => {
+    // Prefer the resolved active thread from parent state; URL may be stale.
+    const activeId = Number((activeThread as any)?.id);
+    if (Number.isFinite(activeId)) return activeId as number;
     let urlId: number | null = null;
     if (typeof window !== "undefined") {
       const m = window.location.pathname.match(/\/chat\/(\d+)/);
@@ -187,9 +210,7 @@ export function GuardianChat({
         if (Number.isFinite(v)) urlId = v;
       }
     }
-    if (urlId != null) return urlId;
-    const n = Number((activeThread as any)?.id);
-    return Number.isFinite(n) ? (n as number) : null;
+    return urlId;
   }, [activeThread?.id]);
 
   // Update currentThreadId when numericThreadId changes
