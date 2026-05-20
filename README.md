@@ -185,6 +185,16 @@ It is a discipline:
 
 ---
 
+## Project Links
+
+Find more about Codexify and Resonant Constructs here:
+
+* Website: https://ResonantConstructs.ai
+* Codexify space: https://Codexify.Space
+* Community: https://reddit.com/r/ResonantConstructs
+  
+---
+
 ## Contributing
 
 Thoughtful contributors are welcome.
@@ -240,5 +250,3 @@ It is early.
 It is real.
 
 It is being built in public where public is safe, and in private where privacy still matters.
-
-```
