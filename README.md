@@ -1,4 +1,4 @@
-````md
+
 # Codexify Core
 
 > Local-first memory infrastructure for people building with AI without surrendering their context, identity, or operating truth.
