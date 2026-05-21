@@ -192,7 +192,7 @@ Find more about Codexify and Resonant Constructs here:
 * Website: https://ResonantConstructs.ai
 * Codexify space: https://Codexify.Space
 * Community: https://reddit.com/r/ResonantConstructs
-  
+* Discord: https://discord.gg/C6AvyWpd 
 ---
 
 ## Contributing
