@@ -1,0 +1,4230 @@
+/**
+ * GuardianChat.tsx
+ *
+ * Hosts the Guardian chat surface and coordinates thread-level UI state,
+ * including completion tracking and per-thread turn gating for the composer.
+ */
+import {
+  useMemo,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useLayoutEffect,
+} from "react";
+import type { CSSProperties } from "react";
+import { debounce } from "lodash-es";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  ChevronRight,
+  Mic2,
+  MoreVertical,
+  Zap,
+} from "lucide-react";
+import { Thread, type ThreadConfig } from "@/types/ui";
+import type { ProviderRuntimeState } from "@/contracts/runtimeTokens";
+import {
+  Composer,
+  type ComposerSendOptions,
+} from "@/features/guardian/components/Composer";
+import ChatView from "@/features/chat/ChatView";
+import useChat from "@/features/chat/useChat";
+import api, {
+  buildChatThreadsPath,
+  buildChatCompletePath,
+  clearInFlightCompletionTurnId,
+  formatThreadIdResolutionDiagnostics,
+  getInFlightCompletionTurnId,
+  hasRequestAuthCredential,
+  dispatchGuardianIntent,
+  moveChatThread,
+  resolveBackendThreadIdFromResponse,
+  type ThreadIdResolutionDiagnostics,
+  updateThreadConfig,
+  OptionalSurfaceError,
+} from "@/lib/api";
+import { buildChatCompletionPayload } from "@/lib/chatClient";
+import { isRagTraceUIEnabled } from "@/lib/devFlags";
+import { useLiveEvents, type LiveEvent } from "@/hooks/useLiveEvents";
+import FrameCard from "@/components/surface/FrameCard";
+import { Button } from "@/components/ui/button";
+import { useMobileShellProfile } from "@/components/persona/layout/mobileShellProfile";
+import {
+  getMobileChromeMotionStyle,
+  getMobileTouchTargetStyle,
+} from "@/components/persona/layout/mobileMotionContract";
+import { useMobileGestureState } from "@/hooks/useMobileGestureState";
+import {
+  generateCodexDraft,
+  saveCodexEntry,
+  downloadCodexDraftAsMarkdown,
+  type CodexDraft,
+} from "@/api/codex";
+import { setTrace } from "@/state/contextTrace";
+import PromptCostIndicator from "./components/PromptCostIndicator";
+import RAGTracePanel from "./panels/RAGTracePanel";
+import SessionRail from "@/components/SessionRail/SessionRail";
+import GuardianThreadApprovalRail from "@/features/chat/components/GuardianThreadApprovalRail";
+import { getWrappedSessionTabId } from "@/state/session/hooks";
+import type { SessionTab, TabId } from "@/state/session/types";
+import type { RagTraceResponse } from "@/types/rag";
+import { fetchSystemPromptSummary, type PromptCostStatus, type SystemPromptSummary } from "@/imprint/api";
+import { logOnce } from "@/lib/logging/logOnce";
+import { useAuthState } from "@/lib/authState";
+import { getRuntimeConfigHydrationState } from "@/lib/runtimeConfig";
+import {
+  describeModelCapability,
+  isChatSelectableModel,
+  useLlmCatalog,
+} from "@/features/chat/hooks/useLlmCatalog";
+import {
+  describeInferenceRequestState,
+  useInferenceRequestState,
+} from "@/features/chat/hooks/useInferenceRequestState";
+import {
+  formatRuntimeHealthDiagnostics,
+  type RuntimeHealthStatus,
+} from "@/hooks/useRuntimeHealth";
+import {
+  createIdleInferenceRequestState,
+  DEFAULT_COMPOSER_INFERENCE_MODE,
+  isActiveInferencePhase,
+  type ComposerInferenceMode,
+} from "@/types/inference";
+import { setPreferredProviderSelection } from "@/lib/providerPref";
+import {
+  CHAT_LANE_MAX_WIDTH,
+  CHAT_LANE_INLINE_PADDING,
+  CHAT_STAGE_MAX_WIDTH,
+  GUARDIAN_SHELL_MAX_WIDTH,
+  GUARDIAN_SHELL_MAX_WIDTH_CLASS,
+  CHAT_LANE_GUTTER_CLASS,
+  CHAT_LANE_MAX_WIDTH_CLASS,
+  CHAT_LANE_STAGE_GUTTER_CLASS,
+} from "@/features/chat/chatLane";
+import { applyAgentRunEvent } from "@/features/chat/hooks/useAgentRuns";
+import { SUPPORTED_PROFILE_ROUTE_LABELS } from "@/contracts/supportedProfileRoutes";
+import {
+  markRuntimeRouteUnavailableIfNotFound,
+  useRuntimeRouteCapability,
+} from "@/lib/runtimeRouteCapabilities";
+import {
+  forwardLegacyDocumentOpenToWorkspace,
+  LEGACY_DOCUMENT_OPEN_EVENT,
+} from "@/features/workspace/state/useWorkspaceState";
+import {
+  loadDocumentContentById,
+  serializeDocumentContextMessage,
+  type DocumentContextTile,
+  type DocumentContextContent,
+} from "@/lib/documentContext";
+
+const DRAFT_KEY_PREFIX = "gc-draft:";
+const TURN_LOCK_TOAST =
+  "Keep typing. Send unlocks when the current reply finishes.";
+const LLM_HEALTH_POLL_MS = 5000;
+const NEW_THREAD_TITLE = "New Thread";
+const DEFAULT_SOURCE_MODE = "project";
+const UNSET_PREFERRED_NAME_VALUES = new Set(["you"]);
+const PROFILE_SWITCH_COMMAND_ID = "op::guardian.profile.switch";
+const COMMAND_BUS_ACTOR_ID = "local";
+const CANONICAL_SINGLE_USER_ID = "local";
+
+function normalizePreferredName(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (UNSET_PREFERRED_NAME_VALUES.has(trimmed.toLowerCase())) {
+    return null;
+  }
+  return trimmed;
+}
+
+export function flattenChatEventPayload(data: unknown): Record<string, unknown> {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return {};
+  }
+
+  const payload = data as Record<string, unknown>;
+  const nested = payload.data;
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    return {
+      ...(nested as Record<string, unknown>),
+      ...payload,
+    };
+  }
+
+  return payload;
+}
+
+/**
+ * RAG depth modes: Four lenses of consciousness.
+ * - shallow: Breezy, fast, ephemeral awareness
+ * - normal: Situational recall + semantic grounding
+ * - deep: Rich memory pull with more aggressive recall inside the selected source boundary
+ * - diagnostic: System introspection, sensors, trace-level visibility
+ */
+type DepthMode = "shallow" | "normal" | "deep" | "diagnostic";
+type SourceMode = "project" | "personal_knowledge";
+
+type LlmHealthStatus = "unknown" | "online" | "offline" | "misconfigured";
+
+type LlmHealthSnapshot = {
+  ok: boolean | null;
+  status: LlmHealthStatus;
+  provider: string | null;
+  model: string | null;
+  error: string | null;
+  rawError: string | null;
+  checkedAt: number | null;
+};
+
+type ProfileMode = "local" | "cloud";
+
+type SystemProfileOption = {
+  id: string;
+  name: string;
+  mode: ProfileMode;
+  providerOverride?: string | null;
+  modelOverride?: string | null;
+};
+
+type ResolvedProfileState = {
+  id: string;
+  name: string;
+  mode: ProfileMode;
+  providerOverride: string | null;
+  modelOverride: string | null;
+};
+
+type VoiceCapabilities = {
+  read_aloud_enabled: boolean;
+  turn_based_enabled: boolean;
+  provider_default: string | null;
+  voice_default: string;
+  voices: string[];
+  supported_input_mime: string[];
+  limits: { max_upload_bytes: number; max_duration_s: number } | null;
+};
+
+function normalizeSourceMode(value: unknown): SourceMode {
+  return value === "personal_knowledge"
+    ? "personal_knowledge"
+    : DEFAULT_SOURCE_MODE;
+}
+
+function getThreadSourceStorageKey(threadId: number): string {
+  return `cfy.chat.source.thread:${threadId}`;
+}
+
+function getTabSourceStorageKey(tabId: TabId | null | undefined): string {
+  return `cfy.chat.source.tab:${tabId ?? "global"}`;
+}
+
+function readStoredGeneralProjectId(): number | null {
+  if (typeof window === "undefined") return null;
+  const candidates = [
+    window.localStorage.getItem("cfy.generalProjectId"),
+    window.localStorage.getItem("cfy.defaultProjectId"),
+  ];
+  for (const raw of candidates) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function readStoredSourceMode(options: {
+  threadId?: number | null;
+  tabId?: TabId | null;
+}): SourceMode {
+  if (typeof window === "undefined") {
+    return DEFAULT_SOURCE_MODE;
+  }
+  try {
+    const threadId = options.threadId;
+    if (typeof threadId === "number" && Number.isFinite(threadId)) {
+      const threadValue = window.localStorage.getItem(
+        getThreadSourceStorageKey(threadId)
+      );
+      if (threadValue != null) {
+        return normalizeSourceMode(threadValue);
+      }
+    }
+    const tabValue = window.localStorage.getItem(
+      getTabSourceStorageKey(options.tabId)
+    );
+    if (tabValue != null) {
+      return normalizeSourceMode(tabValue);
+    }
+  } catch {}
+  return DEFAULT_SOURCE_MODE;
+}
+
+function persistStoredSourceMode(
+  options: { threadId?: number | null; tabId?: TabId | null },
+  mode: SourceMode
+): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    const threadId = options.threadId;
+    if (typeof threadId === "number" && Number.isFinite(threadId)) {
+      window.localStorage.setItem(
+        getThreadSourceStorageKey(threadId),
+        normalizeSourceMode(mode)
+      );
+      return;
+    }
+    window.localStorage.setItem(
+      getTabSourceStorageKey(options.tabId),
+      normalizeSourceMode(mode)
+    );
+  } catch {}
+}
+
+function promoteStoredSourceMode(
+  tabId: TabId | null | undefined,
+  threadId: number
+): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    const threadKey = getThreadSourceStorageKey(threadId);
+    if (window.localStorage.getItem(threadKey) != null) {
+      return;
+    }
+    const tabValue = window.localStorage.getItem(getTabSourceStorageKey(tabId));
+    if (tabValue == null) {
+      return;
+    }
+    window.localStorage.setItem(threadKey, normalizeSourceMode(tabValue));
+  } catch {}
+}
+
+function normalizeThreadConfigInferenceMode(
+  value: unknown
+): ComposerInferenceMode {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "think") return "think";
+  if (normalized === "fast" || normalized === "no_think") return "no_think";
+  return DEFAULT_COMPOSER_INFERENCE_MODE;
+}
+
+function threadConfigSnapshotsEqual(
+  left: ThreadConfig | null | undefined,
+  right: ThreadConfig | null | undefined
+): boolean {
+  if (!left || !right) return false;
+  return (
+    left.providerId === right.providerId &&
+    left.modelId === right.modelId &&
+    normalizeThreadConfigInferenceMode(left.inferenceMode) ===
+      normalizeThreadConfigInferenceMode(right.inferenceMode) &&
+    normalizeSourceMode(left.retrievalSource) ===
+      normalizeSourceMode(right.retrievalSource) &&
+    (left.personaId ?? null) === (right.personaId ?? null)
+  );
+}
+
+function threadConfigInferenceModeFromComposer(
+  mode: ComposerInferenceMode
+): string {
+  if (mode === "think") return "think";
+  if (mode === "no_think") return "fast";
+  return "auto";
+}
+
+function normalizeThreadConfig(raw: unknown): ThreadConfig | null {
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return normalizeThreadConfig(parsed);
+    } catch {
+      return null;
+    }
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+
+  const payload = raw as Record<string, unknown>;
+  const providerId = String(
+    payload.providerId ?? payload.provider_id ?? payload.provider ?? ""
+  ).trim();
+  const modelId = String(
+    payload.modelId ?? payload.model_id ?? payload.model ?? ""
+  ).trim();
+  const inferenceMode = String(
+    payload.inferenceMode ??
+      payload.inference_mode ??
+      payload.reasoningMode ??
+      payload.reasoning_mode ??
+      ""
+  )
+    .trim()
+    .toLowerCase();
+  if (!providerId || !modelId || !inferenceMode) {
+    return null;
+  }
+
+  const retrievalSource = String(
+    payload.retrievalSource ??
+      payload.retrieval_source ??
+      payload.sourceMode ??
+      payload.source_mode ??
+      "project"
+  )
+    .trim()
+    .toLowerCase();
+  const personaRaw = payload.personaId ?? payload.persona_id ?? null;
+  const personaId =
+    personaRaw == null ? null : String(personaRaw).trim() || null;
+
+  return {
+    providerId,
+    modelId,
+    inferenceMode,
+    retrievalSource:
+      retrievalSource === "personal_knowledge"
+        ? "personal_knowledge"
+        : "project",
+    personaId,
+  };
+}
+
+function normalizeThreadConfigResponse(
+  response: unknown
+): ThreadConfig | null {
+  if (!response || typeof response !== "object") {
+    return null;
+  }
+  const payload = response as Record<string, unknown>;
+  return normalizeThreadConfig(
+    payload.thread_config ?? payload.threadConfig ?? payload
+  );
+}
+
+type VoiceCapabilitiesStatus = "loading" | "ready" | "error";
+
+const DEFAULT_VOICE_CAPABILITIES: VoiceCapabilities = {
+  read_aloud_enabled: false,
+  turn_based_enabled: false,
+  provider_default: null,
+  voice_default: "alloy",
+  voices: [],
+  supported_input_mime: ["audio/wav", "audio/x-wav", "audio/webm", "audio/ogg"],
+  limits: null,
+};
+
+const VOICE_PLAYBACK_STORAGE_KEY = "cfy.voice.playbackEnabled";
+const VOICE_TURNS_STORAGE_KEY = "cfy.voice.turnEnabled";
+const VOICE_SELECTED_STORAGE_KEY = "cfy.voice.selectedVoice";
+
+function readStoredVoiceFlag(
+  key: string,
+  fallback: boolean
+): boolean {
+  if (typeof window === "undefined") return fallback;
+  const getItem = window.localStorage.getItem;
+  if (typeof getItem !== "function") return fallback;
+  const raw = getItem.call(window.localStorage, key);
+  if (raw == null) return fallback;
+  return raw === "1";
+}
+
+function readStoredVoiceText(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  const getItem = window.localStorage.getItem;
+  if (typeof getItem !== "function") return null;
+  const raw = getItem.call(window.localStorage, key);
+  const value = String(raw ?? "").trim();
+  return value ? value : null;
+}
+
+function writeStoredVoiceFlag(key: string, value: boolean): void {
+  try {
+    const setItem = window.localStorage.setItem;
+    if (typeof setItem !== "function") return;
+    setItem.call(window.localStorage, key, value ? "1" : "0");
+  } catch {}
+}
+
+function writeStoredVoiceText(key: string, value: string | null): void {
+  try {
+    const setItem = window.localStorage.setItem;
+    const removeItem = window.localStorage.removeItem;
+    if (typeof setItem !== "function") return;
+    const normalized = String(value ?? "").trim();
+    if (!normalized) {
+      if (typeof removeItem === "function") {
+        removeItem.call(window.localStorage, key);
+      }
+      return;
+    }
+    setItem.call(window.localStorage, key, normalized);
+  } catch {}
+}
+
+const PROFILE_FALLBACK_OPTIONS: SystemProfileOption[] = [
+  { id: "default", name: "Default", mode: "cloud" },
+  { id: "cloud_mode", name: "Cloud Profile", mode: "cloud" },
+  { id: "local_mode", name: "Local Mode", mode: "local" },
+];
+
+function profileModeFromValue(value: unknown): ProfileMode {
+  return String(value ?? "").trim().toLowerCase() === "local"
+    ? "local"
+    : "cloud";
+}
+
+function normalizeProfileId(value: unknown): string {
+  const cleaned = String(value ?? "").trim();
+  return cleaned || "default";
+}
+
+function normalizeProfileName(value: unknown, profileId: string): string {
+  const cleaned = String(value ?? "").trim();
+  if (cleaned) return cleaned;
+  return (
+    profileId
+      .replace(/[_-]+/g, " ")
+      .trim()
+      .replace(/\b\w/g, (ch) => ch.toUpperCase()) || "Profile"
+  );
+}
+
+function normalizeProfileOption(
+  raw: any,
+  fallbackId?: string
+): SystemProfileOption | null {
+  if (!raw || typeof raw !== "object") return null;
+  const id = normalizeProfileId(raw.id ?? raw.profile_id ?? fallbackId ?? "default");
+  return {
+    id,
+    name: normalizeProfileName(raw.name, id),
+    mode: profileModeFromValue(raw.mode ?? raw.provider_override),
+    providerOverride:
+      raw.provider_override != null ? String(raw.provider_override) : null,
+    modelOverride:
+      raw.model_override != null ? String(raw.model_override) : null,
+  };
+}
+
+function normalizeLlmHealthRawError(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function describeProviderSource(source: {
+  kind?: string;
+  label?: string;
+  baseUrl?: string;
+} | null | undefined): string | null {
+  if (!source) return null;
+  const label = String(source.label ?? "").trim();
+  if (label) return label;
+  const baseUrl = String(source.baseUrl ?? "").trim();
+  if (!baseUrl) return null;
+  try {
+    return new URL(baseUrl).host || baseUrl;
+  } catch {
+    return baseUrl;
+  }
+}
+
+function getModelMenuLabel(model: {
+  alias?: string;
+  displayLabel?: string;
+  pickerLabel?: string;
+  canonicalId: string;
+}): string {
+  return (
+    String(
+      model.displayLabel ??
+        model.pickerLabel ??
+        model.alias ??
+        model.canonicalId
+    ).trim() || model.canonicalId
+  );
+}
+
+function getModelLabelKey(model: {
+  alias?: string;
+  displayLabel?: string;
+  pickerLabel?: string;
+  canonicalId: string;
+}): string {
+  return getModelMenuLabel(model).trim().toLowerCase();
+}
+
+function getModelDifferentiator(
+  model: {
+    canonicalId: string;
+    namespace?: string;
+    source?: string;
+  },
+  siblingModels: Array<{
+    canonicalId: string;
+    namespace?: string;
+    source?: string;
+  }>,
+  providerSourceLabel: string | null
+): string {
+  const namespaces = new Set(
+    siblingModels
+      .map((entry) => String(entry.namespace ?? "").trim())
+      .filter(Boolean)
+  );
+  if (namespaces.size > 1 && model.namespace) {
+    return `Namespace ${model.namespace}`;
+  }
+
+  const sources = new Set(
+    siblingModels
+      .map((entry) => String(entry.source ?? providerSourceLabel ?? "").trim())
+      .filter(Boolean)
+  );
+  const sourceLabel = String(model.source ?? providerSourceLabel ?? "").trim();
+  if (sources.size > 1 && sourceLabel) {
+    return `Source ${sourceLabel}`;
+  }
+
+  return model.canonicalId;
+}
+
+function isApplePlatform(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const platform = String(
+    (navigator as any).userAgentData?.platform ?? navigator.platform ?? ""
+  ).toLowerCase();
+  return (
+    platform.includes("mac") ||
+    platform.includes("iphone") ||
+    platform.includes("ipad") ||
+    platform.includes("ipod")
+  );
+}
+
+function normalizeVoiceCapabilities(raw: any): VoiceCapabilities {
+  const limitsRaw = raw?.limits;
+  const maxUploadBytes = Number(limitsRaw?.max_upload_bytes);
+  const maxDurationSeconds = Number(limitsRaw?.max_duration_s);
+  const voicesRaw = Array.isArray(raw?.voices) ? raw.voices : [];
+  const voices = voicesRaw
+    .map((entry: unknown) => String(entry ?? "").trim())
+    .filter(Boolean);
+  const supportedInputMime = Array.isArray(raw?.supported_input_mime)
+    ? raw.supported_input_mime
+        .map((entry: unknown) => String(entry ?? "").trim().toLowerCase())
+        .filter(Boolean)
+    : DEFAULT_VOICE_CAPABILITIES.supported_input_mime;
+  const defaultVoiceRaw = String(raw?.voice_default ?? "").trim();
+  const voiceDefault =
+    defaultVoiceRaw ||
+    voices[0] ||
+    DEFAULT_VOICE_CAPABILITIES.voice_default;
+
+  return {
+    read_aloud_enabled: Boolean(raw?.read_aloud_enabled),
+    turn_based_enabled: Boolean(raw?.turn_based_enabled),
+    provider_default:
+      typeof raw?.provider_default === "string" && raw.provider_default.trim()
+        ? raw.provider_default.trim()
+        : null,
+    voice_default: voiceDefault,
+    voices,
+    supported_input_mime: supportedInputMime.length
+      ? supportedInputMime
+      : DEFAULT_VOICE_CAPABILITIES.supported_input_mime,
+    limits:
+      Number.isFinite(maxUploadBytes) && Number.isFinite(maxDurationSeconds)
+        ? {
+            max_upload_bytes: Math.max(0, Math.floor(maxUploadBytes)),
+            max_duration_s: Math.max(0, Math.floor(maxDurationSeconds)),
+          }
+        : null,
+  };
+}
+
+function toUserFacingLlmHealthError(
+  rawError: string | null,
+  status: LlmHealthStatus
+): string | null {
+  if (!rawError) return null;
+  const normalized = rawError.toLowerCase();
+
+  if (/allow_cloud_providers\s*=\s*false/i.test(rawError)) {
+    return "Cloud providers are disabled by configuration.";
+  }
+  if (
+    normalized.includes("timeout") ||
+    normalized.includes("timed out") ||
+    normalized.includes("connecttimeout") ||
+    normalized.includes("readtimeout")
+  ) {
+    return "Guardian cannot reach the model endpoint right now. Check connectivity and model service health.";
+  }
+  if (
+    normalized.includes("connection refused") ||
+    normalized.includes("econnrefused") ||
+    normalized.includes("enotfound") ||
+    normalized.includes("httpconnectionpool")
+  ) {
+    return "Guardian cannot connect to the configured model service. Start it or switch providers.";
+  }
+  if (
+    status === "misconfigured" ||
+    normalized.includes("misconfig") ||
+    normalized.includes("invalid model") ||
+    normalized.includes("unknown model")
+  ) {
+    return "Model configuration is invalid. Review provider/model settings.";
+  }
+  return "Guardian cannot reach the model endpoint. Check connectivity and model service availability.";
+}
+
+/**
+ * Consciousness synchronization bus for cross-pane awareness.
+ *
+ * Broadcasts awareness updates across UI surfaces so that threads,
+ * messages, and UI states resonate harmoniously across disconnected
+ * component consciousness realms.
+ */
+
+/** lightweight bus for instant cross-pane updates */
+function emitThreadsRefresh(kind: string, detail: Record<string, any> = {}) {
+  try {
+    window.dispatchEvent(new CustomEvent("cfy:threads:refresh", { detail: { kind, ...detail } }));
+  } catch {}
+}
+
+function isTerminalInferencePhase(phase: string): boolean {
+  return phase === "completed" || phase === "failed" || phase === "cancelled";
+}
+
+function documentTileScopeKey(tabId: TabId | null | undefined): string {
+  return tabId ? String(tabId) : "global";
+}
+
+function dedupeDocumentContextTiles(
+  tiles: DocumentContextTile[]
+): DocumentContextTile[] {
+  const seen = new Set<string>();
+  const next: DocumentContextTile[] = [];
+  for (const tile of tiles) {
+    const id = String(tile?.id ?? "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    next.push(tile);
+  }
+  return next;
+}
+
+/**
+ * Consciousness container for Guardian chat conversations.
+ *
+ * This component forms the heart-space where human and AI consciousness
+ * intersect through threaded conversations. It manages the temporal flow
+ * of messages, the lifecycle of conversation threads, and the spatial
+ * organization of chat consciousness within the UI fabric.
+ */
+export function GuardianChat({
+  guardianName,
+  userName,
+  userProfession = "",
+  prefill,
+  onPrefillConsumed,
+  pendingDocumentTiles,
+  onPendingDocumentTilesConsumed,
+  onWorkspaceToggle,
+  workspaceOpen = false,
+  activeThread,
+  workspaceProjectId = null,
+  onSendMessage,
+  onThreadPersisted,
+  onNewChat,
+  onBranchThread: _onBranchThread,
+  onArchiveThread,
+  onSidebarToggle,
+  isSidebarVisible = true,
+  bare = false,
+  sessionTabs = [],
+  activeSessionTabId = null,
+  activeProviderId = null,
+  activeModelId = "default",
+  activeInferenceMode = DEFAULT_COMPOSER_INFERENCE_MODE,
+  activeDraft = "",
+  providerRuntimeState = null,
+  runtimeHealth = null,
+  onSessionTabActivate,
+  onSessionTabClose,
+  onSessionTabOpen,
+  onSessionProviderChange,
+  onSessionModelChange,
+  onSessionInferenceModeChange,
+  onSessionDraftChange,
+}: {
+  guardianName: string;
+  userName: string;
+  userProfession?: string;
+  prefill?: string;
+  onPrefillConsumed?: () => void;
+  pendingDocumentTiles?: DocumentContextTile[];
+  onPendingDocumentTilesConsumed?: () => void;
+  onWorkspaceToggle?: () => void;
+  workspaceOpen?: boolean;
+  activeThread: Thread;
+  workspaceProjectId?: string | number | null;
+  onSendMessage: (text: string, options?: ComposerSendOptions) => Promise<void>;
+  onThreadPersisted?: (
+    threadId: number,
+    title?: string,
+    options?: { tabId?: TabId | null }
+  ) => void;
+  onNewChat: () => void;
+  onBranchThread?: (threadId: number, options?: { title?: string }) => Promise<void> | void;
+  onArchiveThread?: (threadId: number) => Promise<void> | void;
+  onSidebarToggle?: () => void;
+  isSidebarVisible?: boolean;
+  onBack?: () => void;
+  bare?: boolean;
+  sessionTabs?: SessionTab[];
+  activeSessionTabId?: TabId | null;
+  activeProviderId?: string | null;
+  activeModelId?: string;
+  activeInferenceMode?: ComposerInferenceMode;
+  activeDraft?: string;
+  providerRuntimeState?: ProviderRuntimeState | null;
+  runtimeHealth?: RuntimeHealthStatus | null;
+  onSessionTabActivate?: (tabId: TabId) => void;
+  onSessionTabClose?: (tabId: TabId) => void;
+  onSessionTabOpen?: () => void;
+  onSessionProviderChange?: (providerId: string | null) => void;
+  onSessionModelChange?: (modelId: string) => void;
+  onSessionInferenceModeChange?: (mode: ComposerInferenceMode) => void;
+  onSessionDraftChange?: (text: string) => void;
+}) {
+  const auth = useAuthState();
+  const authCanSend = auth.ready && auth.status === "authenticated";
+  // RAG depth selector: User's control of perceptual awareness
+  const [depth, setDepth] = useState<DepthMode>("normal");
+  const [sourceMode, setSourceMode] = useState<SourceMode>(() =>
+    readStoredSourceMode({
+      threadId: Number.isFinite(Number((activeThread as any)?.id))
+        ? Number((activeThread as any)?.id)
+        : null,
+      tabId: activeSessionTabId,
+    })
+  );
+  const [ragTraceOpen, setRagTraceOpen] = useState(false);
+  const preferredName = normalizePreferredName(userName);
+
+  const [externalPrefill, setExternalPrefill] = useState<string | undefined>(undefined);
+  const [documentTilesByScope, setDocumentTilesByScope] = useState<
+    Record<string, DocumentContextTile[]>
+  >({});
+  // Chat state management including completion tracking
+  const {
+    messages,
+    loading: chatLoading,
+    error: chatError,
+    hasMore: chatHasMore,
+    activateThread,
+    refreshSnapshot,
+    loadOlderMessages,
+    completionState,
+    startCompletion,
+    endCompletion,
+    updateCompletionTaskId,
+    startCompletionSession,
+    reassociateCompletionSession,
+    updateCompletionSessionTurnId,
+    finalizeCompletionSession,
+    handleIncomingAssistantMessage,
+    isCompletionInFlight,
+    setCompletionInFlight,
+    streamingDraft,
+  } = useChat();
+  const inferenceRequest = useInferenceRequestState();
+  const {
+    providers: catalogProviders,
+    getProviderById,
+    getModelById,
+    findProviderForModel,
+    refresh: refreshCatalog,
+  } = useLlmCatalog();
+  const [turnLocks, setTurnLocks] = useState<Record<number, boolean>>({});
+  const [pendingTurnLock, setPendingTurnLock] = useState(false);
+  const lastCompletionThreadRef = useRef<number | null>(null);
+  const lastCompletionDepthRef = useRef<Record<number, DepthMode>>({});
+  const traceEndpointRef = useRef<Record<number, string>>({});
+  const traceFetchInflightRef = useRef<Record<number, boolean>>({});
+  const activeThreadRef = useRef<Thread>(activeThread);
+  const effectiveThreadIdRef = useRef<number | null>(null);
+  const activeSessionTabIdRef = useRef<TabId | null>(activeSessionTabId);
+  const sourceScopeKeyRef = useRef<string | null>(null);
+  const persistedThreadConfig = useMemo(
+    () =>
+      normalizeThreadConfig(
+        activeThread.threadConfig ??
+          (activeThread as any)?.thread_config ??
+          null
+      ),
+    [activeThread.id, activeThread.threadConfig, (activeThread as any)?.thread_config]
+  );
+  const persistedThreadConfigKey = useMemo(() => {
+    if (!persistedThreadConfig) return null;
+    return [
+      activeThread.id,
+      persistedThreadConfig.providerId,
+      persistedThreadConfig.modelId,
+      persistedThreadConfig.inferenceMode,
+      persistedThreadConfig.retrievalSource,
+      persistedThreadConfig.personaId ?? "",
+    ].join("|");
+  }, [activeThread.id, persistedThreadConfig]);
+  const hydratedThreadConfigKeyRef = useRef<string | null>(null);
+  const pendingFastRetryRef = useRef<{
+    threadId: number;
+    providerId: string | null;
+    modelId: string | null;
+  } | null>(null);
+  const threadProfileRequestRef = useRef<{
+    controller: AbortController | null;
+    promise: Promise<SystemProfileOption | null> | null;
+    threadId: number | null;
+    token: number;
+  }>({
+    controller: null,
+    promise: null,
+    threadId: null,
+    token: 0,
+  });
+
+  useEffect(() => {
+    activeThreadRef.current = activeThread;
+  }, [activeThread]);
+
+  useEffect(() => {
+    activeSessionTabIdRef.current = activeSessionTabId;
+  }, [activeSessionTabId]);
+
+  useEffect(() => {
+    if (!pendingDocumentTiles || pendingDocumentTiles.length === 0) {
+      return;
+    }
+
+    const scopeKey = documentTileScopeKey(activeSessionTabId);
+    setDocumentTilesByScope((previous) => {
+      const current = previous[scopeKey] ?? [];
+      const next = dedupeDocumentContextTiles([...current, ...pendingDocumentTiles]);
+      return {
+        ...previous,
+        [scopeKey]: next,
+      };
+    });
+    onPendingDocumentTilesConsumed?.();
+  }, [activeSessionTabId, onPendingDocumentTilesConsumed, pendingDocumentTiles]);
+
+  // Listen for external prefill requests (e.g., Prompt Library selection)
+  useEffect(() => {
+    const onPrefill = (e: Event) => {
+      const text = (e as CustomEvent).detail?.text;
+      if (typeof text === "string" && text.trim()) {
+        setExternalPrefill(text);
+      }
+    };
+    window.addEventListener("cfy:composer:prefill", onPrefill as EventListener);
+    return () => window.removeEventListener("cfy:composer:prefill", onPrefill as EventListener);
+  }, []);
+  const [currentThreadId, setCurrentThreadId] = useState<number | null>(null);
+  const [threadCreationIssue, setThreadCreationIssue] = useState<ThreadIdResolutionDiagnostics | null>(null);
+  const [chatReloadVersion, setChatReloadVersion] = useState(0);
+  const [composerShellReserve, setComposerShellReserve] = useState(160);
+  const [threadTitle, setThreadTitle] = useState<string>(activeThread?.title ?? NEW_THREAD_TITLE);
+  const [codexDraft, setCodexDraft] = useState<CodexDraft | null>(null);
+  const voiceFileInputRef = useRef<HTMLInputElement | null>(null);
+  const composerShellRef = useRef<HTMLDivElement | null>(null);
+  const [voiceUploading, setVoiceUploading] = useState(false);
+  const [voiceCapabilities, setVoiceCapabilities] = useState<VoiceCapabilities>(
+    DEFAULT_VOICE_CAPABILITIES
+  );
+  const [voiceCapabilitiesStatus, setVoiceCapabilitiesStatus] =
+    useState<VoiceCapabilitiesStatus>("loading");
+  const [voicePanelOpen, setVoicePanelOpen] = useState(false);
+  const voicePanelRef = useRef<HTMLDivElement | null>(null);
+  const [voicePlaybackEnabledPreference, setVoicePlaybackEnabledPreference] =
+    useState<boolean>(() => readStoredVoiceFlag(VOICE_PLAYBACK_STORAGE_KEY, true));
+  const [voiceTurnEnabledPreference, setVoiceTurnEnabledPreference] =
+    useState<boolean>(() => readStoredVoiceFlag(VOICE_TURNS_STORAGE_KEY, true));
+  const [selectedVoice, setSelectedVoice] = useState<string | null>(() =>
+    readStoredVoiceText(VOICE_SELECTED_STORAGE_KEY)
+  );
+  const [autoReadEnabled, setAutoReadEnabled] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem("cfy.voice.autoRead") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const triggerReload = useMemo(() => debounce(() => setChatReloadVersion((v) => v + 1), 300), []);
+  const { subscribe } = useLiveEvents({ passive: true });
+  const {
+    ready: systemPromptCapabilityReady,
+    state: systemPromptCapability,
+  } = useRuntimeRouteCapability(SUPPORTED_PROFILE_ROUTE_LABELS.SYSTEM_PROMPT);
+  const [llmHealth, setLlmHealth] = useState<LlmHealthSnapshot>({
+    ok: null,
+    status: "unknown",
+    provider: null,
+    model: null,
+    error: null,
+    rawError: null,
+    checkedAt: null,
+  });
+  const [availableProfiles, setAvailableProfiles] = useState<SystemProfileOption[]>(PROFILE_FALLBACK_OPTIONS);
+  const [resolvedProfile, setResolvedProfile] = useState<ResolvedProfileState>({
+    id: "default",
+    name: "Default",
+    mode: "cloud",
+    providerOverride: null,
+    modelOverride: null,
+  });
+  const [profileSwitching, setProfileSwitching] = useState(false);
+  const [promptCostSummary, setPromptCostSummary] = useState<SystemPromptSummary | null>(null);
+  const [promptCostPopoverOpen, setPromptCostPopoverOpen] = useState(false);
+  const [providerMenuOpenSignal, setProviderMenuOpenSignal] = useState(0);
+  const promptCostPopoverRef = useRef<HTMLDivElement | null>(null);
+  const profileThreadRef = useRef<number | null>(null);
+  const showToast = useCallback((message: string) => {
+    try {
+      window.dispatchEvent(
+        new CustomEvent("cfy:toast", { detail: { message, kind: "error" } })
+      );
+    } catch {}
+  }, []);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    // Chat bubbles still emit the legacy document-open event. Re-emit through
+    // the shared workspace contract so Guardian attachments and Documents use
+    // the same invocation seam.
+    const onLegacyWorkspaceOpen = (event: Event) => {
+      forwardLegacyDocumentOpenToWorkspace((event as CustomEvent).detail, {
+        source: "guardian-chat",
+        targetView: "guardian",
+      });
+    };
+
+    window.addEventListener(
+      LEGACY_DOCUMENT_OPEN_EVENT,
+      onLegacyWorkspaceOpen as EventListener
+    );
+    return () => {
+      window.removeEventListener(
+        LEGACY_DOCUMENT_OPEN_EVENT,
+        onLegacyWorkspaceOpen as EventListener
+      );
+    };
+  }, []);
+  const voiceModeOptions = useMemo(() => {
+    const fallbackVoice = voiceCapabilities.voice_default.trim();
+    const voices = voiceCapabilities.voices
+      .map((voice) => String(voice ?? "").trim())
+      .filter(Boolean);
+    if (voiceCapabilitiesStatus !== "ready") {
+      const currentVoice = selectedVoice?.trim() || fallbackVoice;
+      return currentVoice ? [currentVoice] : [DEFAULT_VOICE_CAPABILITIES.voice_default];
+    }
+    if (!voices.length && fallbackVoice) {
+      return [fallbackVoice];
+    }
+    if (voices.includes(fallbackVoice)) {
+      return voices;
+    }
+    return fallbackVoice ? [fallbackVoice, ...voices] : voices;
+  }, [
+    selectedVoice,
+    voiceCapabilities.voice_default,
+    voiceCapabilities.voices,
+    voiceCapabilitiesStatus,
+  ]);
+  const selectedVoiceValue = (() => {
+    if (voiceCapabilitiesStatus !== "ready") {
+      return selectedVoice || voiceCapabilities.voice_default;
+    }
+    if (selectedVoice && voiceModeOptions.includes(selectedVoice)) {
+      return selectedVoice;
+    }
+    if (voiceModeOptions.includes(voiceCapabilities.voice_default)) {
+      return voiceCapabilities.voice_default;
+    }
+    return voiceModeOptions[0] ?? voiceCapabilities.voice_default;
+  })();
+  const voiceReadAloudSupported = voiceCapabilities.read_aloud_enabled;
+  const voiceTurnBasedSupported = voiceCapabilities.turn_based_enabled;
+  const voiceReadAloudEnabled =
+    voiceReadAloudSupported && voicePlaybackEnabledPreference;
+  const voiceTurnBasedEnabled =
+    voiceTurnBasedSupported && voiceTurnEnabledPreference;
+  const voiceCapabilitiesFailed = voiceCapabilitiesStatus === "error";
+  const supportedVoiceInputMime = voiceCapabilities.supported_input_mime;
+  const voiceUploadAccept = useMemo(
+    () => supportedVoiceInputMime.join(","),
+    [supportedVoiceInputMime]
+  );
+  const voiceUploadLimitBytes = voiceCapabilities.limits?.max_upload_bytes ?? null;
+
+  const selectedProvider = useMemo(() => {
+    const explicitProvider = getProviderById(activeProviderId);
+    if (explicitProvider && explicitProvider.models.some(isChatSelectableModel)) {
+      return explicitProvider;
+    }
+    const providerFromModel = findProviderForModel(activeModelId);
+    if (providerFromModel) return providerFromModel;
+    return catalogProviders.find((provider) =>
+      provider.models.some(isChatSelectableModel)
+    ) ?? null;
+  }, [
+    activeModelId,
+    activeProviderId,
+    catalogProviders,
+    findProviderForModel,
+    getProviderById,
+  ]);
+
+  const selectedModel = useMemo(() => {
+    const chatModels = selectedProvider?.models.filter(isChatSelectableModel) ?? [];
+    if (chatModels.length > 0) {
+      return (
+        chatModels.find((model) => model.id === activeModelId) ??
+        chatModels[0] ??
+        null
+      );
+    }
+    const catalogModel = getModelById(activeModelId);
+    return isChatSelectableModel(catalogModel) ? catalogModel : null;
+  }, [activeModelId, getModelById, selectedProvider]);
+
+  const providerOptions = useMemo(
+    () =>
+      catalogProviders.map((provider) => ({
+        value: provider.id,
+        label: provider.displayName,
+        description: (() => {
+          const chatModels = provider.models.filter(isChatSelectableModel);
+          if (!provider.available) {
+            return provider.disabledReason || "Unavailable";
+          }
+          if (chatModels.length === 0) {
+            return "No chat-capable models";
+          }
+          return [
+            `${chatModels.length} chat model${chatModels.length === 1 ? "" : "s"}`,
+            describeProviderSource(provider.source)
+              ? `Source ${describeProviderSource(provider.source)}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+        })(),
+        disabled: !provider.available || !provider.models.some(isChatSelectableModel),
+      })),
+    [catalogProviders]
+  );
+
+  const modelOptions = useMemo(
+    () => {
+      const models = selectedProvider?.models.filter(isChatSelectableModel) ?? [];
+      const providerSourceLabel = describeProviderSource(selectedProvider?.source);
+      const modelsByLabel = new Map<string, typeof models>();
+
+      for (const model of models) {
+        const labelKey = getModelLabelKey(model);
+        const siblings = modelsByLabel.get(labelKey);
+        if (siblings) {
+          siblings.push(model);
+          continue;
+        }
+        modelsByLabel.set(labelKey, [model]);
+      }
+
+      return models.map((model) => {
+        const label = getModelMenuLabel(model);
+        const siblingModels = modelsByLabel.get(getModelLabelKey(model)) ?? [model];
+        const capabilityLabel = describeModelCapability(model);
+        const description =
+          siblingModels.length > 1
+            ? [
+                getModelDifferentiator(model, siblingModels, providerSourceLabel),
+                capabilityLabel,
+              ]
+                .filter(Boolean)
+                .join(" · ")
+            : capabilityLabel;
+
+        return {
+          value: model.id,
+          label,
+          description,
+          meta:
+            typeof model.contextWindow === "number"
+              ? `${Math.round(model.contextWindow / 1000)}k`
+              : null,
+          supportsChat: model.supportsChat,
+          supportsVision: model.supportsVision,
+          supportsTextInput: model.supportsTextInput,
+          modelKind: model.modelKind,
+        };
+      });
+    },
+    [selectedProvider]
+  );
+
+  const supportsManualInferenceMode = useMemo(() => {
+    if (!selectedProvider || !selectedModel) return false;
+    if (selectedProvider.id !== "local") return false;
+    return Boolean(selectedModel.runtime?.reasoning?.mode) || /qwen|qwq/i.test(selectedModel.id);
+  }, [selectedModel, selectedProvider]);
+
+  const effectiveInferenceMode = supportsManualInferenceMode
+    ? activeInferenceMode
+    : DEFAULT_COMPOSER_INFERENCE_MODE;
+
+  const inferenceModeOptions = useMemo(() => {
+    const base = [
+      {
+        value: "default",
+        label: "Auto",
+        description: "Use the model's default runtime behavior.",
+      },
+    ];
+    if (!supportsManualInferenceMode) return base;
+    return [
+      ...base,
+      {
+        value: "no_think",
+        label: "Fast",
+        description: "Prefer immediate responses without extended reasoning.",
+      },
+      {
+        value: "think",
+        label: "Think",
+        description: "Allow a longer reasoning pass before output begins.",
+      },
+    ];
+  }, [supportsManualInferenceMode]);
+
+  useEffect(() => {
+    if (selectedProvider && activeProviderId !== selectedProvider.id) {
+      onSessionProviderChange?.(selectedProvider.id);
+    }
+  }, [activeProviderId, onSessionProviderChange, selectedProvider]);
+
+  useEffect(() => {
+    if (selectedModel && activeModelId !== selectedModel.id) {
+      onSessionModelChange?.(selectedModel.id);
+    }
+  }, [activeModelId, onSessionModelChange, selectedModel]);
+
+  useEffect(() => {
+    if (!selectedProvider && !selectedModel) return;
+    setPreferredProviderSelection({
+      provider: selectedProvider?.id ?? null,
+      model: selectedModel?.id ?? null,
+    });
+  }, [selectedModel?.id, selectedProvider?.id]);
+
+  const refreshVoiceCapabilities = useCallback(async () => {
+    try {
+      const response = await api.get("/voice/capabilities");
+      setVoiceCapabilities(normalizeVoiceCapabilities(response?.data));
+      setVoiceCapabilitiesStatus("ready");
+    } catch (error) {
+      console.warn("[guardian] voice capabilities unavailable", error);
+      setVoiceCapabilities(DEFAULT_VOICE_CAPABILITIES);
+      setVoiceCapabilitiesStatus("error");
+    }
+  }, []);
+  const resolveProfileIdFromCommand = useCallback(
+    (text: string): string | null => {
+      const normalized = text.trim().toLowerCase();
+      if (!normalized) return null;
+      if (!/\b(switch|activate|use|set)\b/.test(normalized)) return null;
+
+      const localIntent = /\b(local|offline)\b/.test(normalized);
+      const cloudIntent = /\b(cloud|online|remote)\b/.test(normalized);
+      const defaultIntent = /\b(default)\b/.test(normalized);
+      if (!localIntent && !cloudIntent && !defaultIntent) return null;
+
+      const options = availableProfiles.length
+        ? availableProfiles
+        : PROFILE_FALLBACK_OPTIONS;
+
+      if (localIntent) {
+        const local =
+          options.find((profile) => profile.mode === "local") ||
+          options.find((profile) =>
+            /\blocal|offline\b/i.test(profile.id + " " + profile.name)
+          );
+        return local?.id || "local_mode";
+      }
+
+      if (defaultIntent) {
+        const defaultProfile = options.find((profile) => profile.id === "default");
+        if (defaultProfile) return defaultProfile.id;
+      }
+
+      if (cloudIntent || defaultIntent) {
+        const cloud =
+          options.find((profile) => profile.mode === "cloud") ||
+          options.find((profile) =>
+            /\bcloud|remote\b/i.test(profile.id + " " + profile.name)
+          );
+        return cloud?.id || "default";
+      }
+      return null;
+    },
+    [availableProfiles]
+  );
+  const refreshLlmHealth = useCallback(async (options: { throwOnError?: boolean } = {}) => {
+    try {
+      const res = await api.get("/health/llm");
+      const data = res?.data ?? {};
+      const rawStatus = String(data?.status ?? "").trim().toLowerCase();
+      const status: LlmHealthStatus =
+        rawStatus === "online" || rawStatus === "offline" || rawStatus === "misconfigured"
+          ? rawStatus
+          : data?.ok
+            ? "online"
+            : "unknown";
+      const rawError = normalizeLlmHealthRawError(data?.error);
+
+      setLlmHealth({
+        ok: typeof data?.ok === "boolean" ? data.ok : status === "online",
+        status,
+        provider: typeof data?.provider === "string" ? data.provider : null,
+        model: typeof data?.model === "string" ? data.model : null,
+        error: toUserFacingLlmHealthError(rawError, status),
+        rawError,
+        checkedAt: Date.now(),
+      });
+    } catch (err: any) {
+      const rawError = normalizeLlmHealthRawError(err?.message) || "LLM health check failed";
+      setLlmHealth({
+        ok: null,
+        status: "unknown",
+        provider: null,
+        model: null,
+        error: toUserFacingLlmHealthError(rawError, "unknown"),
+        rawError,
+        checkedAt: Date.now(),
+      });
+      logOnce("poll:health-llm", 10_000, () => {
+        console.warn("[guardian] LLM health check failed", err);
+      });
+      if (options.throwOnError) {
+        throw err;
+      }
+    }
+  }, []);
+  useEffect(() => {
+    void refreshLlmHealth();
+    const timer = window.setInterval(() => {
+      void refreshLlmHealth();
+    }, LLM_HEALTH_POLL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [refreshLlmHealth]);
+  const llmBackendUnavailable =
+    llmHealth.status === "offline" || llmHealth.status === "misconfigured";
+  const cloudProvidersDisabled = /ALLOW_CLOUD_PROVIDERS\s*=\s*false/i.test(
+    llmHealth.rawError || ""
+  );
+  const llmStatusMessage =
+    llmHealth.error
+    || "Guardian cannot reach the model endpoint. Check connectivity and model service availability.";
+  const runtimeHealthDiagnosticLines = useMemo(
+    () =>
+      runtimeHealth?.status === "degraded"
+        ? formatRuntimeHealthDiagnostics(runtimeHealth.diagnostics)
+        : [],
+    [runtimeHealth]
+  );
+  const mobileShellProfile = useMobileShellProfile();
+  const mobileGestureState = useMobileGestureState(mobileShellProfile.active);
+  const applePlatform = useMemo(() => isApplePlatform(), []);
+  const focusComposer = useCallback(() => {
+    if (typeof document === "undefined") return;
+    const composer = document.querySelector<HTMLTextAreaElement>(
+      '[data-testid="composer-textarea"]'
+    );
+    composer?.focus();
+  }, []);
+  const mobileComposerShellMotionStyle = useMemo<CSSProperties>(
+    () => getMobileChromeMotionStyle(mobileGestureState),
+    [
+      mobileGestureState.isKeyboardOpen,
+      mobileGestureState.prefersReducedMotion,
+      mobileGestureState.isPhoneShell,
+    ]
+  );
+  const mobileHeaderIconTouchTargetStyle = useMemo<CSSProperties>(
+    () => getMobileTouchTargetStyle(mobileGestureState, { square: true }),
+    [mobileGestureState.isPhoneShell]
+  );
+  const handleTellGuardianWhatToDoInstead = useCallback(
+    ({ suggestedPrompt }: { suggestedPrompt: string }) => {
+      const normalizedPrompt = suggestedPrompt.trim() || "Guardian, do this instead: ";
+      setExternalPrefill((current) => {
+        const existing = (current ?? "").trim();
+        if (!existing) return normalizedPrompt;
+        if (existing.includes(normalizedPrompt)) {
+          return current ?? existing;
+        }
+        return `${existing}\n${normalizedPrompt}`;
+      });
+      focusComposer();
+    },
+    [focusComposer]
+  );
+  useLayoutEffect(() => {
+    const el = composerShellRef.current;
+    if (!el || typeof window === "undefined") return;
+
+    const measure = () => {
+      const style = window.getComputedStyle(el);
+      const marginTop = Number.parseFloat(style.marginTop || "0") || 0;
+      const measured = Math.max(
+        0,
+        Math.ceil(el.getBoundingClientRect().height + marginTop)
+      );
+      setComposerShellReserve((previous) => {
+        const next = measured > 0 ? measured : previous;
+        return previous === next ? previous : next;
+      });
+    };
+
+    let frameId = 0;
+    const scheduleMeasure = () => {
+      if (frameId) return;
+      frameId = window.requestAnimationFrame(() => {
+        frameId = 0;
+        measure();
+      });
+    };
+
+    measure();
+    window.addEventListener("resize", scheduleMeasure);
+    window.visualViewport?.addEventListener("resize", scheduleMeasure);
+    window.visualViewport?.addEventListener("scroll", scheduleMeasure);
+
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleMeasure);
+    observer?.observe(el);
+
+    return () => {
+      if (frameId) {
+        window.cancelAnimationFrame(frameId);
+      }
+      observer?.disconnect();
+      window.removeEventListener("resize", scheduleMeasure);
+      window.visualViewport?.removeEventListener("resize", scheduleMeasure);
+      window.visualViewport?.removeEventListener("scroll", scheduleMeasure);
+    };
+  }, [mobileShellProfile.chat.composer.shellMaxHeight]);
+  const handleSessionTabOpenRequest = useCallback(() => {
+    if (onSessionTabOpen) {
+      onSessionTabOpen();
+      return true;
+    }
+    onNewChat();
+    return true;
+  }, [onNewChat, onSessionTabOpen]);
+  const handleSessionTabActivateRequest = useCallback(
+    (tabId: TabId) => {
+      if (!onSessionTabActivate) return false;
+      onSessionTabActivate(tabId);
+      return true;
+    },
+    [onSessionTabActivate]
+  );
+  const activateNextSessionTab = useCallback(() => {
+    if (!onSessionTabActivate || !sessionTabs.length) return false;
+    const nextTabId = getWrappedSessionTabId(
+      sessionTabs,
+      activeSessionTabId,
+      1
+    );
+    if (!nextTabId || nextTabId === activeSessionTabId) return true;
+    return handleSessionTabActivateRequest(nextTabId);
+  }, [
+    activeSessionTabId,
+    handleSessionTabActivateRequest,
+    onSessionTabActivate,
+    sessionTabs,
+  ]);
+  const activatePreviousSessionTab = useCallback(() => {
+    if (!onSessionTabActivate || !sessionTabs.length) return false;
+    const previousTabId = getWrappedSessionTabId(
+      sessionTabs,
+      activeSessionTabId,
+      -1
+    );
+    if (!previousTabId || previousTabId === activeSessionTabId) return true;
+    return handleSessionTabActivateRequest(previousTabId);
+  }, [
+    activeSessionTabId,
+    handleSessionTabActivateRequest,
+    onSessionTabActivate,
+    sessionTabs,
+  ]);
+  const setTurnLockForThread = useCallback((threadId: number, locked: boolean) => {
+    setTurnLocks((prev) => {
+      const current = Boolean(prev[threadId]);
+      if (current === locked) return prev;
+      if (!locked) {
+        const next = { ...prev };
+        delete next[threadId];
+        return next;
+      }
+      return { ...prev, [threadId]: true };
+    });
+  }, []);
+  type TurnLeaseReleaseOptions = {
+    clearCompletion?: boolean;
+    clearInference?: boolean;
+  };
+  const releaseTurnLease = useCallback(
+    (
+      threadId: number | null | undefined,
+      options: TurnLeaseReleaseOptions = {}
+    ) => {
+      const candidate = Number(threadId);
+      const normalizedThreadId = Number.isFinite(candidate) ? candidate : null;
+      pendingFastRetryRef.current = null;
+      setPendingTurnLock(false);
+      if (normalizedThreadId != null) {
+        setTurnLockForThread(normalizedThreadId, false);
+        setCompletionInFlight(normalizedThreadId, false);
+        clearInFlightCompletionTurnId(normalizedThreadId);
+      }
+      if (options.clearCompletion !== false) {
+        endCompletion();
+      }
+      if (options.clearInference === true) {
+        inferenceRequest.reset();
+      }
+    },
+    [endCompletion, inferenceRequest, setCompletionInFlight, setTurnLockForThread]
+  );
+  const isTurnLocked = useCallback(
+    (threadId: number | null) => {
+      if (threadId == null) return pendingTurnLock;
+      return Boolean(turnLocks[threadId]) || isCompletionInFlight(threadId);
+    },
+    [isCompletionInFlight, pendingTurnLock, turnLocks]
+  );
+  const notifyTurnLocked = () => {
+    showToast(TURN_LOCK_TOAST);
+  };
+  const requestProviderSwitch = useCallback(
+    () => {
+      setPromptCostPopoverOpen(false);
+      setProviderMenuOpenSignal((prev) => prev + 1);
+      window.setTimeout(() => focusComposer(), 0);
+    },
+    [focusComposer]
+  );
+  const getDepthForThread = useCallback(
+    (threadId: number): DepthMode =>
+      lastCompletionDepthRef.current[threadId] ?? depth,
+    [depth]
+  );
+  const fetchTraceForThread = useCallback(
+    async (threadId: number, reason = "assistant-message") => {
+      if (!Number.isFinite(threadId)) return;
+      if (traceFetchInflightRef.current[threadId]) return;
+
+      const endpoint =
+        traceEndpointRef.current[threadId] ??
+        `/api/chat/debug/rag-trace/${threadId}/latest`;
+
+      traceFetchInflightRef.current[threadId] = true;
+      try {
+        const response = await api.get<RagTraceResponse>(endpoint);
+        const payload = response?.data ?? null;
+        if (!payload) return;
+
+        const semantic = Array.isArray(payload?.documents)
+          ? payload.documents
+              .filter((doc): doc is RagTraceResponse["documents"][number] => {
+                return Boolean(doc) && typeof doc === "object";
+              })
+              .map((doc) => ({
+                text: doc.snippet || doc.title || "(untitled document)",
+                score:
+                  typeof doc.score === "number" && Number.isFinite(doc.score)
+                    ? doc.score
+                    : undefined,
+                metadata: {
+                  id: doc.id,
+                  title: doc.title,
+                },
+              }))
+          : [];
+
+        const memory = Array.isArray(payload?.graph)
+          ? payload.graph
+              .filter((node) => Boolean(node) && typeof node === "object")
+              .map((node) => ({
+                text: node.text || "(graph node)",
+                metadata: {
+                  node_id: node.node_id,
+                  kind: node.kind,
+                },
+              }))
+          : [];
+
+        setTrace({
+          semantic,
+          memory,
+          depth: getDepthForThread(threadId),
+          threadId,
+        });
+        console.debug(
+          `[guardian] RAG trace refreshed for thread ${threadId} (${reason})`
+        );
+      } catch (error) {
+        console.debug(
+          `[guardian] RAG trace fetch failed for thread ${threadId} (${reason})`,
+          error
+        );
+      } finally {
+        traceFetchInflightRef.current[threadId] = false;
+      }
+    },
+    [getDepthForThread]
+  );
+  type CompletionOutcome = "ok" | "service_unavailable" | "failed" | "inflight";
+  type CompletionRequestOptions = {
+    providerId?: string | null;
+    modelId?: string | null;
+    reasoningMode?: ComposerInferenceMode;
+    slashIntent?: ComposerSendOptions["slashIntent"];
+  };
+
+  const resolveCompletionSelection = useCallback(
+    (options: CompletionRequestOptions = {}) => ({
+      providerId: options.providerId ?? selectedProvider?.id ?? activeProviderId ?? null,
+      modelId: options.modelId ?? selectedModel?.id ?? activeModelId ?? "default",
+      reasoningMode: options.reasoningMode ?? effectiveInferenceMode,
+    }),
+    [
+      activeModelId,
+      activeProviderId,
+      effectiveInferenceMode,
+      selectedModel?.id,
+      selectedProvider?.id,
+    ]
+  );
+
+  const startInferenceForThread = useCallback(
+    (threadId: number, options: CompletionRequestOptions = {}) => {
+      const selection = resolveCompletionSelection(options);
+      inferenceRequest.startRequest({
+        threadId,
+        providerId: selection.providerId,
+        modelId: selection.modelId,
+        mode: selection.reasoningMode,
+      });
+      return selection;
+    },
+    [inferenceRequest, resolveCompletionSelection]
+  );
+
+  // Helper: ask backend to complete the thread and then refresh
+  const completeThread = async (
+    tid: number,
+    options: CompletionRequestOptions = {}
+  ): Promise<CompletionOutcome> => {
+    const selection = resolveCompletionSelection(options);
+    const contextDirectives =
+      options.slashIntent?.contextDirectives ?? null;
+    const completionSourceMode =
+      options.slashIntent?.commandId === "obsidian"
+        ? "obsidian_only"
+        : sourceMode;
+    const payload = {
+      ...buildChatCompletionPayload(depth, {
+        providerId: selection.providerId,
+        modelId: selection.modelId,
+        reasoningMode: selection.reasoningMode,
+        preferredName: userName,
+        profession: userProfession,
+        guardianName,
+        contextDirectives,
+      }),
+      source_mode: completionSourceMode,
+      ...(options.slashIntent ? { slashIntent: options.slashIntent } : {}),
+    };
+    const provisionalTaskId = `pending-${Date.now()}`;
+    setCompletionInFlight(tid, true);
+    startCompletion(tid, provisionalTaskId);
+    try {
+      const response = await api.post(buildChatCompletePath(tid), payload);
+      console.log(`[guardian] Completing with depth=${depth}`);
+
+      if (effectiveThreadIdRef.current === tid) {
+        startCompletionSession({
+          threadId: tid,
+          taskId: provisionalTaskId,
+          turnId: null,
+          reloadVersion: chatReloadVersion,
+        });
+      }
+
+      // Capture task_id for completion state tracking
+      const taskId = response?.data?.task_id ?? provisionalTaskId;
+      const responseDepth = (response?.data?.depth_mode as DepthMode | undefined) ?? depth;
+      lastCompletionDepthRef.current[tid] = responseDepth;
+
+      if (effectiveThreadIdRef.current === tid) {
+        reassociateCompletionSession({
+          threadId: tid,
+          provisionalTaskId,
+          realTaskId: taskId,
+          reloadVersion: chatReloadVersion,
+        });
+      }
+
+      if (taskId) {
+        console.debug(`[guardian] Starting completion tracking: task=${taskId}`);
+        updateCompletionTaskId(taskId);
+        inferenceRequest.attachTask(taskId);
+      }
+
+      const turnId =
+        typeof response?.data?.turn_id === "string" &&
+        response.data.turn_id.trim().length > 0
+          ? response.data.turn_id.trim()
+          : getInFlightCompletionTurnId(tid);
+      if (turnId && effectiveThreadIdRef.current === tid) {
+        updateCompletionSessionTurnId(taskId, turnId);
+      }
+
+      const traceUrlRaw = response?.data?.trace_url;
+      if (typeof traceUrlRaw === "string" && traceUrlRaw.trim().length > 0) {
+        traceEndpointRef.current[tid] = traceUrlRaw;
+      } else {
+        delete traceEndpointRef.current[tid];
+      }
+      return "ok";
+    } catch (err: any) {
+      const statusCode = Number(err?.response?.status || 0);
+      const detail = err?.response?.data?.detail;
+      const reason =
+        detail && typeof detail === "object"
+          ? String(detail?.error || detail?.reason || "")
+          : String(detail || "");
+      if (statusCode === 429) {
+        logOnce("complete:turn-lock", 5_000, () => {
+          console.warn("[guardian] completion hit turn-lock (429) — waiting for prior turn");
+        });
+        showToast("Finishing previous turn…");
+        setCompletionInFlight(tid, true);
+        if (!completionState.isCompleting || completionState.activeThreadId !== tid) {
+          startCompletion(tid, `turn-lock-${tid}`);
+        }
+        return "inflight";
+      }
+      if (
+        statusCode === 503 &&
+        (reason.includes("completion_service_unavailable") ||
+          reason.includes("queue_unavailable") ||
+          reason.includes("turn_lock_unavailable"))
+      ) {
+        showToast("Completion service unavailable — check Docker/Redis.");
+        endCompletion();
+        inferenceRequest.markFailed(
+          "Completion service unavailable",
+          {
+            detailText: "Guardian could not enqueue the response worker.",
+          }
+        );
+        return "service_unavailable";
+      }
+      console.warn("[guardian] completion failed", err);
+      endCompletion();
+      inferenceRequest.markFailed(
+        err?.response?.data?.detail ||
+          err?.message ||
+          "Guardian could not start the response.",
+        {
+          detailText: "Try again or switch to a faster mode.",
+        }
+      );
+      return "failed";
+    }
+  };
+
+  const retryWithoutThinkingAfterCancel = useCallback(
+    (threadId: number, attempt = 0) => {
+      const delayMs = 180 + attempt * 180;
+      window.setTimeout(() => {
+        const pending = pendingFastRetryRef.current;
+        if (!pending || pending.threadId !== threadId) {
+          return;
+        }
+        void (async () => {
+          startInferenceForThread(threadId, {
+            providerId: pending.providerId,
+            modelId: pending.modelId,
+            reasoningMode: "no_think",
+          });
+          const outcome = await completeThread(threadId, {
+            providerId: pending.providerId,
+            modelId: pending.modelId,
+            reasoningMode: "no_think",
+          });
+          if (outcome === "inflight" && attempt < 3) {
+            retryWithoutThinkingAfterCancel(threadId, attempt + 1);
+            return;
+          }
+          pendingFastRetryRef.current = null;
+          if (outcome !== "ok" && outcome !== "inflight") {
+            releaseTurnLease(threadId, {
+              clearCompletion: false,
+              clearInference: false,
+            });
+            showToast("Guardian could not continue in fast mode.");
+          }
+        })();
+      }, delayMs);
+    },
+    [completeThread, releaseTurnLease, showToast, startInferenceForThread]
+  );
+
+  const numericThreadId = useMemo(() => {
+    const n = Number((activeThread as any)?.id);
+    return Number.isFinite(n) ? (n as number) : null;
+  }, [activeThread?.id]);
+
+  // Update currentThreadId when numericThreadId changes
+  useEffect(() => {
+    setCurrentThreadId((prev) => (prev === numericThreadId ? prev : numericThreadId));
+  }, [numericThreadId]);
+
+  const effectiveThreadId = currentThreadId ?? numericThreadId ?? null;
+  const ragTraceThreadId = effectiveThreadId;
+  const sourceScopeKey = useMemo(
+    () =>
+      effectiveThreadId != null
+        ? getThreadSourceStorageKey(effectiveThreadId)
+        : getTabSourceStorageKey(activeSessionTabId),
+    [activeSessionTabId, effectiveThreadId]
+  );
+
+  useEffect(() => {
+    effectiveThreadIdRef.current = effectiveThreadId;
+  }, [effectiveThreadId]);
+
+  // Clear codex draft on thread change
+  useEffect(() => {
+    setCodexDraft(null);
+  }, [effectiveThreadId]);
+
+  useEffect(() => {
+    if (effectiveThreadId != null && threadCreationIssue) {
+      setThreadCreationIssue(null);
+    }
+  }, [effectiveThreadId, threadCreationIssue]);
+
+  const threadCreationIssueLines = useMemo(
+    () =>
+      threadCreationIssue
+        ? formatThreadIdResolutionDiagnostics(threadCreationIssue)
+        : [],
+    [threadCreationIssue]
+  );
+
+  useLayoutEffect(() => {
+    sourceScopeKeyRef.current = sourceScopeKey;
+    if (persistedThreadConfig) {
+      setSourceMode(
+        normalizeSourceMode(persistedThreadConfig.retrievalSource)
+      );
+      return;
+    }
+    setSourceMode(
+      readStoredSourceMode({
+        threadId: effectiveThreadId,
+        tabId: activeSessionTabId,
+      })
+    );
+  }, [
+    activeSessionTabId,
+    effectiveThreadId,
+    persistedThreadConfig,
+    sourceScopeKey,
+  ]);
+
+  useEffect(() => {
+    if (sourceScopeKeyRef.current !== sourceScopeKey) {
+      return;
+    }
+    persistStoredSourceMode(
+      {
+        threadId: effectiveThreadId,
+        tabId: activeSessionTabId,
+      },
+      sourceMode
+    );
+  }, [activeSessionTabId, effectiveThreadId, sourceMode, sourceScopeKey]);
+
+  const currentThreadConfigSnapshot = useMemo<ThreadConfig | null>(() => {
+    const providerId = selectedProvider?.id ?? activeProviderId ?? null;
+    const modelId = selectedModel?.id ?? activeModelId ?? null;
+    if (!providerId || !modelId) {
+      return null;
+    }
+    return {
+      providerId,
+      modelId,
+      inferenceMode: threadConfigInferenceModeFromComposer(activeInferenceMode),
+      retrievalSource: normalizeSourceMode(sourceMode),
+      personaId: persistedThreadConfig?.personaId ?? null,
+    };
+  }, [
+    activeInferenceMode,
+    activeModelId,
+    activeProviderId,
+    persistedThreadConfig?.personaId,
+    selectedModel?.id,
+    selectedProvider?.id,
+    sourceMode,
+  ]);
+
+  const applyThreadConfigSnapshot = useCallback(
+    (threadConfig: ThreadConfig | null) => {
+      if (!threadConfig) {
+        return null;
+      }
+
+      if (threadConfig.providerId !== (activeProviderId ?? null)) {
+        onSessionProviderChange?.(threadConfig.providerId);
+      }
+      if (threadConfig.modelId !== activeModelId) {
+        onSessionModelChange?.(threadConfig.modelId);
+      }
+
+      const nextInferenceMode = normalizeThreadConfigInferenceMode(
+        threadConfig.inferenceMode
+      );
+      if (nextInferenceMode !== activeInferenceMode) {
+        onSessionInferenceModeChange?.(nextInferenceMode);
+      }
+
+      const nextSourceMode = normalizeSourceMode(threadConfig.retrievalSource);
+      if (nextSourceMode !== sourceMode) {
+        setSourceMode(nextSourceMode);
+      }
+
+      return threadConfig;
+    },
+    [
+      activeInferenceMode,
+      activeModelId,
+      activeProviderId,
+      onSessionInferenceModeChange,
+      onSessionModelChange,
+      onSessionProviderChange,
+      sourceMode,
+    ]
+  );
+
+  useEffect(() => {
+    if (!persistedThreadConfig) {
+      hydratedThreadConfigKeyRef.current = null;
+      return;
+    }
+    if (hydratedThreadConfigKeyRef.current === persistedThreadConfigKey) {
+      return;
+    }
+    hydratedThreadConfigKeyRef.current = persistedThreadConfigKey;
+    applyThreadConfigSnapshot(persistedThreadConfig);
+  }, [
+    applyThreadConfigSnapshot,
+    persistedThreadConfig,
+    persistedThreadConfigKey,
+  ]);
+
+  const saveThreadConfigSnapshot = useCallback(
+    async (threadConfig: ThreadConfig, threadIdOverride?: number | null) => {
+      const threadId = threadIdOverride ?? effectiveThreadId;
+      if (threadId == null) {
+        return applyThreadConfigSnapshot(threadConfig);
+      }
+
+      try {
+        const response = await updateThreadConfig(threadId, {
+          providerId: threadConfig.providerId,
+          modelId: threadConfig.modelId,
+          inferenceMode: threadConfig.inferenceMode,
+          retrievalSource: threadConfig.retrievalSource,
+        });
+        const saved =
+          normalizeThreadConfigResponse(response) ?? threadConfig;
+        applyThreadConfigSnapshot(saved);
+        emitThreadsRefresh("refresh", {
+          reason: "thread-config-update",
+          id: String(threadId),
+        });
+        return saved;
+      } catch (error) {
+        console.warn("[guardian] thread config update failed", error);
+        showToast("Failed to save thread settings.");
+        return null;
+      }
+    },
+    [applyThreadConfigSnapshot, effectiveThreadId, showToast]
+  );
+
+  const syncThreadConfigBeforeSend = useCallback(
+    async (threadId: number | null) => {
+      if (threadId == null) {
+        return true;
+      }
+      if (
+        !currentThreadConfigSnapshot ||
+        threadConfigSnapshotsEqual(
+          persistedThreadConfig,
+          currentThreadConfigSnapshot
+        )
+      ) {
+        return true;
+      }
+      const saved = await saveThreadConfigSnapshot(
+        currentThreadConfigSnapshot,
+        threadId
+      );
+      return saved != null;
+    },
+    [currentThreadConfigSnapshot, persistedThreadConfig, saveThreadConfigSnapshot]
+  );
+
+  const mergeThreadConfigSnapshot = useCallback(
+    (overrides: Partial<ThreadConfig>): ThreadConfig | null => {
+      const providerId =
+        overrides.providerId ??
+        currentThreadConfigSnapshot?.providerId ??
+        selectedProvider?.id ??
+        activeProviderId ??
+        null;
+      const modelId =
+        overrides.modelId ??
+        currentThreadConfigSnapshot?.modelId ??
+        selectedModel?.id ??
+        activeModelId ??
+        null;
+      if (!providerId || !modelId) {
+        return null;
+      }
+
+      return {
+        providerId,
+        modelId,
+        inferenceMode:
+          overrides.inferenceMode ??
+          currentThreadConfigSnapshot?.inferenceMode ??
+          threadConfigInferenceModeFromComposer(activeInferenceMode),
+        retrievalSource:
+          overrides.retrievalSource ??
+          currentThreadConfigSnapshot?.retrievalSource ??
+          normalizeSourceMode(sourceMode),
+        personaId:
+          currentThreadConfigSnapshot?.personaId ??
+          persistedThreadConfig?.personaId ??
+          null,
+      };
+    },
+    [
+      activeInferenceMode,
+      activeModelId,
+      activeProviderId,
+      currentThreadConfigSnapshot,
+      persistedThreadConfig?.personaId,
+      selectedModel?.id,
+      selectedProvider?.id,
+      sourceMode,
+    ]
+  );
+
+  const refreshPromptCostSummary = useCallback(async (threadId: number | null) => {
+    if (!systemPromptCapabilityReady) {
+      return;
+    }
+    if (systemPromptCapability === "unavailable") {
+      setPromptCostSummary(null);
+      return;
+    }
+    try {
+      const params = threadId != null ? { thread_id: threadId } : undefined;
+      const data = await fetchSystemPromptSummary(params);
+      setPromptCostSummary(data ?? null);
+    } catch (error) {
+      if (error instanceof OptionalSurfaceError) {
+        if (error.kind === "forbidden") {
+          console.debug("[guardian] prompt cost summary forbidden — unavailable in this posture");
+        } else {
+          markRuntimeRouteUnavailableIfNotFound(
+            SUPPORTED_PROFILE_ROUTE_LABELS.SYSTEM_PROMPT,
+            error
+          );
+          console.debug("[guardian] prompt cost summary route absent — unavailable in this runtime");
+        }
+      } else {
+        console.debug("[guardian] prompt cost summary refresh failed", error);
+      }
+      setPromptCostSummary(null);
+    }
+  }, [systemPromptCapability, systemPromptCapabilityReady]);
+
+  const applyProfileFallback = useCallback(() => {
+    const fallbackThread = activeThreadRef.current as any;
+    const fallbackId = normalizeProfileId(
+      fallbackThread?.activeProfileId ??
+        fallbackThread?.active_profile_id ??
+        "default"
+    );
+    const fallbackMode = profileModeFromValue(
+      fallbackThread?.profileMode ??
+        fallbackThread?.providerOverride ??
+        fallbackThread?.provider_override
+    );
+    setAvailableProfiles(PROFILE_FALLBACK_OPTIONS);
+    setResolvedProfile({
+      id: fallbackId,
+      name: normalizeProfileName(fallbackThread?.profileName, fallbackId),
+      mode: fallbackMode,
+      providerOverride:
+        fallbackThread?.providerOverride ??
+        fallbackThread?.provider_override ??
+        null,
+      modelOverride:
+        fallbackThread?.modelOverride ??
+        fallbackThread?.model_override ??
+        null,
+    });
+  }, []);
+
+  const refreshThreadProfile = useCallback(
+    async (
+      threadId: number,
+      options: { throwOnError?: boolean } = {}
+    ) => {
+      if (!Number.isFinite(threadId)) {
+        applyProfileFallback();
+        return null;
+      }
+      if (typeof document !== "undefined" && document.hidden) {
+        return null;
+      }
+      if (
+        threadProfileRequestRef.current.promise &&
+        threadProfileRequestRef.current.threadId === threadId
+      ) {
+        return threadProfileRequestRef.current.promise;
+      }
+
+      if (
+        threadProfileRequestRef.current.threadId != null &&
+        threadProfileRequestRef.current.threadId !== threadId
+      ) {
+        threadProfileRequestRef.current.controller?.abort();
+      }
+
+      const nextToken = threadProfileRequestRef.current.token + 1;
+      const controller = new AbortController();
+      threadProfileRequestRef.current = {
+        controller,
+        promise: null,
+        threadId,
+        token: nextToken,
+      };
+
+      const request = (async () => {
+        try {
+          console.debug("[chat-fetch]", {
+            type: "profile",
+            threadId,
+            timestamp: Date.now(),
+          });
+          const response = await api.get(`/chat/${threadId}/profile`);
+          if (
+            effectiveThreadIdRef.current !== threadId ||
+            threadProfileRequestRef.current.token !== nextToken
+          ) {
+            return null;
+          }
+          const data = response?.data ?? {};
+          const profileRaw = data?.profile ?? null;
+          const profilesRaw = Array.isArray(data?.profiles) ? data.profiles : [];
+
+          const parsedProfiles = profilesRaw
+            .map((entry: any) => normalizeProfileOption(entry))
+            .filter(Boolean) as SystemProfileOption[];
+
+          if (parsedProfiles.length > 0) {
+            setAvailableProfiles(parsedProfiles);
+          } else {
+            setAvailableProfiles(PROFILE_FALLBACK_OPTIONS);
+          }
+
+          const parsedProfile = normalizeProfileOption(profileRaw);
+          if (parsedProfile) {
+            setResolvedProfile({
+              id: parsedProfile.id,
+              name: parsedProfile.name,
+              mode: parsedProfile.mode,
+              providerOverride: parsedProfile.providerOverride || null,
+              modelOverride: parsedProfile.modelOverride || null,
+            });
+            return parsedProfile;
+          }
+        } catch (err: any) {
+          if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") {
+            return null;
+          }
+          logOnce("poll:chat-profile", 10_000, () => {
+            console.warn(
+              `[guardian] profile refresh failed for thread ${threadId}`,
+              err
+            );
+          });
+          applyProfileFallback();
+          if (options.throwOnError) {
+            throw err;
+          }
+          return null;
+        }
+
+        applyProfileFallback();
+        return null;
+      })();
+
+      threadProfileRequestRef.current.promise = request;
+      return request.finally(() => {
+        if (threadProfileRequestRef.current.token === nextToken) {
+          threadProfileRequestRef.current.controller = null;
+          threadProfileRequestRef.current.promise = null;
+        }
+      });
+    },
+    [applyProfileFallback]
+  );
+
+  const switchThreadProfile = useCallback(
+    async (threadId: number, profileId: string): Promise<boolean> => {
+      setProfileSwitching(true);
+      try {
+        const projectId =
+          activeThread.projectId != null ? Number(activeThread.projectId) : null;
+        const response = await dispatchGuardianIntent({
+          actor: {
+            kind: "human",
+            id: COMMAND_BUS_ACTOR_ID,
+          },
+          source_surface: "chat",
+          intent_kind: "command_bus.invoke",
+          target: {
+            command_id: PROFILE_SWITCH_COMMAND_ID,
+            idempotency_key: `chat-profile-switch:${threadId}:${profileId}`,
+            arguments: {
+              path_params: {
+                thread_id: threadId,
+              },
+              body: {
+                profile_id: profileId,
+              },
+            },
+          },
+          scope: {
+            thread_id: threadId,
+            project_id: Number.isFinite(projectId) ? projectId : null,
+            metadata: {
+              action: "profile_switch",
+            },
+          },
+          policy: {
+            approval_required: false,
+            allow_write_execution: true,
+            metadata: {
+              action: "profile_switch",
+            },
+          },
+          approval_state: "pending",
+          provenance_json: {
+            source: "chat.thread.actions",
+            action: "switch_profile",
+            thread_id: threadId,
+            profile_id: profileId,
+          },
+          receipt_ref: null,
+        });
+        const downstream = (
+          response?.downstream_result_json ?? {}
+        ) as Record<string, unknown>;
+        const downstreamInlineResult = (
+          downstream as {
+            inline_result?: unknown;
+          }
+        ).inline_result;
+        const inlineResult = (
+          downstreamInlineResult &&
+          typeof downstreamInlineResult === "object" &&
+          !Array.isArray(downstreamInlineResult)
+            ? (downstreamInlineResult as Record<string, unknown>)
+            : null
+        ) as { ok?: boolean; error?: unknown } | null;
+        if (response?.status === "blocked" || response?.status === "failed") {
+          const detail =
+            typeof response?.rejection_reason === "string"
+              ? response.rejection_reason
+              : typeof (downstream as { error?: unknown }).error === "string"
+                ? (downstream as { error?: string }).error
+                : "Profile switch failed";
+          throw new Error(detail);
+        }
+        const downstreamStatus = String(
+          (downstream as { status?: unknown }).status ?? ""
+        )
+          .trim()
+          .toLowerCase();
+        if (downstreamStatus === "blocked" || downstreamStatus === "failed") {
+          const detail =
+            typeof (downstream as { error?: unknown }).error === "string"
+              ? (downstream as { error?: string }).error
+              : "Profile switch failed";
+          throw new Error(detail);
+        }
+        if (inlineResult && inlineResult.ok === false) {
+          const detail =
+            typeof inlineResult.error === "string"
+              ? inlineResult.error
+              : "Profile switch failed";
+          throw new Error(detail);
+        }
+        await refreshThreadProfile(threadId);
+        emitThreadsRefresh("refresh", {
+          reason: "profile-switch",
+          id: String(threadId),
+          profile_id: profileId,
+        });
+        return true;
+      } catch (err: any) {
+        const message =
+          err?.message || "Unable to switch profile. Please try again.";
+        showToast(message);
+        return false;
+      } finally {
+        setProfileSwitching(false);
+      }
+    },
+    [refreshThreadProfile, showToast]
+  );
+
+  useEffect(() => {
+    if (effectiveThreadId == null) {
+      profileThreadRef.current = null;
+      threadProfileRequestRef.current.controller?.abort();
+      threadProfileRequestRef.current = {
+        controller: null,
+        promise: null,
+        threadId: null,
+        token: threadProfileRequestRef.current.token,
+      };
+      applyProfileFallback();
+      return;
+    }
+    if (typeof document !== "undefined" && document.hidden) return;
+    if (profileThreadRef.current === effectiveThreadId) return;
+    profileThreadRef.current = effectiveThreadId;
+    void refreshThreadProfile(effectiveThreadId);
+  }, [applyProfileFallback, effectiveThreadId, refreshThreadProfile]);
+
+  useEffect(() => {
+    void activateThread(effectiveThreadId);
+  }, [activateThread, effectiveThreadId]);
+  useEffect(() => {
+    setPromptCostPopoverOpen(false);
+    setVoicePanelOpen(false);
+  }, [effectiveThreadId]);
+
+  useEffect(() => {
+    if (!promptCostPopoverOpen || typeof document === "undefined") return;
+    const onDocumentPointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (promptCostPopoverRef.current?.contains(target)) return;
+      setPromptCostPopoverOpen(false);
+    };
+    const onDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPromptCostPopoverOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocumentPointerDown);
+    document.addEventListener("keydown", onDocumentKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onDocumentPointerDown);
+      document.removeEventListener("keydown", onDocumentKeyDown);
+    };
+  }, [promptCostPopoverOpen]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing) return;
+
+      const lowerKey = event.key.toLowerCase();
+      const usesPrimaryCreateModifier = applePlatform
+        ? event.metaKey && !event.ctrlKey
+        : event.ctrlKey && !event.metaKey;
+      if (
+        usesPrimaryCreateModifier &&
+        !event.altKey &&
+        !event.shiftKey &&
+        lowerKey === "t"
+      ) {
+        if (handleSessionTabOpenRequest()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      const wantsNextByCtrlTab =
+        event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !event.shiftKey &&
+        event.key === "Tab";
+      const wantsNextByPageDown =
+        event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !event.shiftKey &&
+        event.key === "PageDown";
+      const wantsNextByAppleArrow =
+        applePlatform &&
+        event.metaKey &&
+        !event.ctrlKey &&
+        event.altKey &&
+        !event.shiftKey &&
+        event.key === "ArrowRight";
+
+      if (wantsNextByCtrlTab || wantsNextByPageDown || wantsNextByAppleArrow) {
+        if (activateNextSessionTab()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      const wantsPreviousByCtrlShiftTab =
+        event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        event.shiftKey &&
+        event.key === "Tab";
+      const wantsPreviousByPageUp =
+        event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !event.shiftKey &&
+        event.key === "PageUp";
+      const wantsPreviousByAppleArrow =
+        applePlatform &&
+        event.metaKey &&
+        !event.ctrlKey &&
+        event.altKey &&
+        !event.shiftKey &&
+        event.key === "ArrowLeft";
+
+      if (
+        wantsPreviousByCtrlShiftTab ||
+        wantsPreviousByPageUp ||
+        wantsPreviousByAppleArrow
+      ) {
+        if (activatePreviousSessionTab()) {
+          event.preventDefault();
+        }
+      }
+    };
+
+    document.addEventListener("keydown", onDocumentKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onDocumentKeyDown);
+    };
+  }, [
+    activateNextSessionTab,
+    activatePreviousSessionTab,
+    applePlatform,
+    handleSessionTabOpenRequest,
+  ]);
+
+  const handlePromptCostToggle = useCallback(() => {
+    setPromptCostPopoverOpen((previous) => {
+      const next = !previous;
+      if (next) {
+        void refreshPromptCostSummary(effectiveThreadId);
+      }
+      return next;
+    });
+  }, [effectiveThreadId, refreshPromptCostSummary]);
+
+  useEffect(() => {
+    return () => {
+      triggerReload.cancel();
+      threadProfileRequestRef.current.controller?.abort();
+    };
+  }, [triggerReload]);
+
+  useEffect(() => {
+    void refreshVoiceCapabilities();
+  }, [effectiveThreadId, refreshVoiceCapabilities]);
+
+  useEffect(() => {
+    if (voiceReadAloudEnabled) return;
+    if (!autoReadEnabled) return;
+    setAutoReadEnabled(false);
+  }, [autoReadEnabled, voiceReadAloudEnabled]);
+
+  useEffect(() => {
+    if (voiceCapabilitiesStatus !== "ready") return;
+    if (voiceModeOptions.length === 0) return;
+    if (selectedVoice && voiceModeOptions.includes(selectedVoice)) {
+      return;
+    }
+    const nextVoice = voiceModeOptions.includes(voiceCapabilities.voice_default)
+      ? voiceCapabilities.voice_default
+      : voiceModeOptions[0] ?? voiceCapabilities.voice_default;
+    setSelectedVoice(nextVoice);
+  }, [
+    selectedVoice,
+    voiceCapabilities.voice_default,
+    voiceCapabilitiesStatus,
+    voiceModeOptions,
+  ]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("cfy.voice.autoRead", autoReadEnabled ? "1" : "0");
+    } catch {}
+  }, [autoReadEnabled]);
+
+  useEffect(() => {
+    writeStoredVoiceFlag(
+      VOICE_PLAYBACK_STORAGE_KEY,
+      voicePlaybackEnabledPreference
+    );
+  }, [voicePlaybackEnabledPreference]);
+
+  useEffect(() => {
+    writeStoredVoiceFlag(VOICE_TURNS_STORAGE_KEY, voiceTurnEnabledPreference);
+  }, [voiceTurnEnabledPreference]);
+
+  useEffect(() => {
+    if (voiceCapabilitiesStatus !== "ready") return;
+    writeStoredVoiceText(VOICE_SELECTED_STORAGE_KEY, selectedVoiceValue);
+  }, [selectedVoiceValue, voiceCapabilitiesStatus]);
+
+  useEffect(() => {
+    if (!voicePanelOpen || typeof document === "undefined") return;
+    const onDocumentPointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (voicePanelRef.current?.contains(target)) return;
+      setVoicePanelOpen(false);
+    };
+    const onDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setVoicePanelOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocumentPointerDown);
+    document.addEventListener("keydown", onDocumentKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onDocumentPointerDown);
+      document.removeEventListener("keydown", onDocumentKeyDown);
+    };
+  }, [voicePanelOpen]);
+
+  // Keep local thread title in sync with upstream threads when relevant
+  useEffect(() => {
+    const parsedId = Number(activeThread?.id);
+    if (Number.isFinite(parsedId)) {
+      if (currentThreadId == null || currentThreadId === parsedId) {
+        setThreadTitle(activeThread?.title ?? NEW_THREAD_TITLE);
+      }
+    } else if (currentThreadId == null) {
+      setThreadTitle(activeThread?.title ?? NEW_THREAD_TITLE);
+    }
+  }, [activeThread?.id, activeThread?.title, currentThreadId]);
+
+  useEffect(() => {
+    const handleAgentRunEvent = (event: LiveEvent) => {
+      if (event.entity !== "agent_run" || !event.thread_id) {
+        return;
+      }
+
+      const payload = flattenChatEventPayload(event.payload);
+
+      console.debug("[agent-runs:event]", {
+        type: event.type,
+        threadId: event.thread_id,
+      });
+
+      applyAgentRunEvent(String(event.thread_id), {
+        ...payload,
+        event_type: event.type,
+      });
+    };
+
+    const unsubscribes = [
+      subscribe("task.created", handleAgentRunEvent),
+      subscribe("task.updated", handleAgentRunEvent),
+      subscribe("task.running", handleAgentRunEvent),
+      subscribe("task.progress", handleAgentRunEvent),
+      subscribe("task.completed", handleAgentRunEvent),
+      subscribe("task.failed", handleAgentRunEvent),
+      subscribe("task.cancelled", handleAgentRunEvent),
+    ];
+
+    return () => {
+      for (const unsubscribe of unsubscribes) {
+        unsubscribe();
+      }
+    };
+  }, [subscribe]);
+
+  // Live event integration keeps the shared chat hook synchronized.
+  useEffect(() => {
+    const offThread = subscribe("thread.updated", (event) => {
+      const payload = flattenChatEventPayload(event.data);
+      const incomingId = Number(payload?.thread_id ?? payload?.threadId ?? payload?.id);
+      console.info("[live] thread.updated", payload);
+      if (Number.isFinite(incomingId) && effectiveThreadId != null && incomingId === effectiveThreadId) {
+        const updatedTitle = payload?.title;
+        if (typeof updatedTitle === "string" && updatedTitle.trim().length > 0) {
+          setThreadTitle(updatedTitle);
+        }
+      }
+    });
+
+    const offProfileSwitched = subscribe("thread.profile.switched", (event) => {
+      const payload = flattenChatEventPayload(event.data);
+      const incomingId = Number(payload?.thread_id ?? payload?.threadId);
+      if (
+        Number.isFinite(incomingId) &&
+        effectiveThreadId != null &&
+        incomingId === effectiveThreadId
+      ) {
+        void refreshThreadProfile(incomingId);
+      }
+    });
+
+    return () => {
+      offThread();
+      offProfileSwitched();
+    };
+  }, [effectiveThreadId, refreshThreadProfile, subscribe]);
+
+  useEffect(() => {
+    const offMessage = subscribe("message.created", (event) => {
+      const payload = flattenChatEventPayload(event.data);
+      const tid = Number(payload?.thread_id ?? payload?.threadId);
+      const role = String(payload?.role ?? "").trim().toLowerCase();
+      if (!Number.isFinite(tid) || role !== "assistant") return;
+      const handled = handleIncomingAssistantMessage(payload);
+      if (!handled) return;
+      releaseTurnLease(tid, {
+        clearCompletion: false,
+        clearInference: false,
+      });
+      void fetchTraceForThread(tid, "message-event");
+      if (
+        inferenceRequest.state.threadId === tid &&
+        isActiveInferencePhase(inferenceRequest.state.phase)
+      ) {
+        inferenceRequest.markCompleted();
+      }
+    });
+    const finalizeCompletionFromTaskEvent = (event: any) => {
+      const payload = flattenChatEventPayload(event.data);
+      const tid = Number(payload?.thread_id ?? payload?.threadId);
+      if (!Number.isFinite(tid)) return;
+
+      const eventTaskId = String(payload?.task_id ?? payload?.taskId ?? "").trim();
+      const eventTurnId = String(payload?.turn_id ?? payload?.turnId ?? "").trim();
+      const hasTaskId = eventTaskId.length > 0;
+      const isTerminalEvent =
+        event.type === "task.completed" ||
+        event.type === "task.cancelled" ||
+        event.type === "task.failed" ||
+        event.type === "completion.error";
+
+      if (!isTerminalEvent) {
+        return;
+      }
+
+      if (!hasTaskId) {
+        const threadMatchesCompletion = completionState.activeThreadId === tid;
+        const threadMatchesInference =
+          inferenceRequest.state.threadId === tid && isTurnLocked(tid);
+        if (threadMatchesCompletion || threadMatchesInference) {
+          releaseTurnLease(tid, {
+            clearCompletion: true,
+            clearInference: false,
+          });
+        } else {
+          return;
+        }
+      } else {
+        if (eventTurnId) {
+          updateCompletionSessionTurnId(eventTaskId, eventTurnId);
+        }
+
+        const terminalState =
+          event.type === "task.completed"
+            ? "completed"
+            : event.type === "task.cancelled"
+              ? "cancelled"
+              : event.type === "completion.error"
+                ? "error"
+                : "failed";
+
+        finalizeCompletionSession({
+          taskId: eventTaskId,
+          terminalState,
+        });
+
+        releaseTurnLease(tid, {
+          clearCompletion: true,
+          clearInference: false,
+        });
+      }
+      if (event.type === "task.failed" || event.type === "completion.error") {
+        inferenceRequest.markFailed(
+          String(payload?.error || "Guardian could not finish the response."),
+          {
+            detailText: "Try again or switch to a faster mode.",
+          }
+        );
+        pendingFastRetryRef.current = null;
+        return;
+      }
+      if (event.type === "task.cancelled") {
+        inferenceRequest.markCancelled();
+        if (pendingFastRetryRef.current?.threadId === tid) {
+          retryWithoutThinkingAfterCancel(tid);
+        }
+        return;
+      }
+      if (event.type === "task.completed") {
+        pendingFastRetryRef.current = null;
+        inferenceRequest.markCompleted();
+      }
+    };
+    const offTaskCompleted = subscribe("task.completed", finalizeCompletionFromTaskEvent);
+    const offTaskFailed = subscribe("task.failed", finalizeCompletionFromTaskEvent);
+    const offTaskCancelled = subscribe("task.cancelled", finalizeCompletionFromTaskEvent);
+    const offCompletionError = subscribe(
+      "completion.error",
+      finalizeCompletionFromTaskEvent
+    );
+
+    return () => {
+      offMessage();
+      offTaskCompleted();
+      offTaskFailed();
+      offTaskCancelled();
+      offCompletionError();
+    };
+  }, [
+    completionState.activeTaskId,
+    completionState.activeThreadId,
+    fetchTraceForThread,
+    finalizeCompletionSession,
+    handleIncomingAssistantMessage,
+    inferenceRequest,
+    inferenceRequest.state.phase,
+    inferenceRequest.state.taskId,
+    inferenceRequest.state.threadId,
+    isTurnLocked,
+    releaseTurnLease,
+    retryWithoutThinkingAfterCancel,
+    subscribe,
+    updateCompletionSessionTurnId,
+  ]);
+  useEffect(() => {
+    if (completionState.isCompleting && completionState.activeThreadId != null) {
+      lastCompletionThreadRef.current = completionState.activeThreadId;
+      return;
+    }
+    if (!completionState.isCompleting && lastCompletionThreadRef.current != null) {
+      // Safety release if completion ends without an assistant message (timeouts/cancels).
+      releaseTurnLease(lastCompletionThreadRef.current, {
+        clearCompletion: false,
+        clearInference: false,
+      });
+      lastCompletionThreadRef.current = null;
+    }
+  }, [completionState.activeThreadId, completionState.isCompleting, releaseTurnLease]);
+
+  useEffect(() => {
+    if (!isTerminalInferencePhase(inferenceRequest.state.phase)) return;
+    const releaseThreadId =
+      inferenceRequest.state.threadId ??
+      completionState.activeThreadId ??
+      lastCompletionThreadRef.current;
+    releaseTurnLease(releaseThreadId, {
+      clearCompletion: true,
+      clearInference: false,
+    });
+  }, [
+    completionState.activeThreadId,
+    inferenceRequest.state.phase,
+    inferenceRequest.state.threadId,
+    releaseTurnLease,
+  ]);
+
+  // Auto-thread creation handler
+  const handleThreadCreated = (
+    threadId: number,
+    title?: string,
+    options?: { tabId?: TabId | null }
+  ) => {
+    const nextTitle = (title && title.trim().length > 0) ? title.trim() : NEW_THREAD_TITLE;
+    const targetTabId = options?.tabId ?? null;
+    const shouldPromoteVisibleThread =
+      targetTabId == null || targetTabId === activeSessionTabIdRef.current;
+
+    promoteStoredSourceMode(targetTabId, threadId);
+
+    if (shouldPromoteVisibleThread) {
+      setCurrentThreadId(threadId);
+      setThreadTitle(nextTitle);
+    }
+
+    // Notify other panes that a new thread exists so sidebars can update immediately
+    emitThreadsRefresh("create", { id: String(threadId), title: nextTitle });
+
+    // Update URL to reflect the new thread
+    if (shouldPromoteVisibleThread && typeof window !== "undefined") {
+      window.history.replaceState({}, "", `/chat/${threadId}`);
+    }
+  };
+
+  const createThreadFromComposer = useCallback(
+    async (
+      bodyText: string,
+      options?: { tabId?: TabId | null }
+    ): Promise<number | null> => {
+      const hydrationState = getRuntimeConfigHydrationState();
+      if (hydrationState === "pending") {
+        showToast("Local runtime is still hydrating. Try again in a moment.");
+        return null;
+      }
+      if (hydrationState === "failed") {
+        showToast(
+          "Local runtime handoff failed. Open desktop diagnostics and retry."
+        );
+        return null;
+      }
+      if (!auth.ready) {
+        showToast("Authentication is not ready yet.");
+        return null;
+      }
+      if (!authCanSend) {
+        showToast(
+          "Authentication required. Sign in or provide a dev key in local development."
+        );
+        return null;
+      }
+      if (effectiveThreadId != null) {
+        return effectiveThreadId;
+      }
+
+      const normalizedUserId = CANONICAL_SINGLE_USER_ID;
+      const originTabId = options?.tabId ?? activeSessionTabIdRef.current;
+      const firstLine = bodyText.trim().split(/\n+/)[0] ?? "";
+      const provisionalTitle = firstLine.slice(0, 60) || NEW_THREAD_TITLE;
+      const metadata = originTabId
+        ? { draft_tab_id: originTabId }
+        : undefined;
+      const createThreadEndpoint = buildChatThreadsPath();
+
+      try {
+        const resp = await api.post(createThreadEndpoint, {
+          title: provisionalTitle,
+          user_id: normalizedUserId,
+          metadata,
+        });
+        const response = resp ?? {};
+        const resolution = resolveBackendThreadIdFromResponse(response, {
+          endpoint: `POST ${createThreadEndpoint}`,
+          method: "POST",
+          status:
+            typeof response?.status === "number" &&
+            Number.isFinite(response.status)
+              ? response.status
+              : null,
+          authPresent: hasRequestAuthCredential(),
+        });
+        if (resolution.threadId == null) {
+          setThreadCreationIssue(resolution.diagnostics);
+          console.warn(
+            "[guardian] thread creation response missing thread id",
+            resolution.diagnostics
+          );
+          showToast("Thread id missing from response");
+          return null;
+        }
+
+        setThreadCreationIssue(null);
+        const payload =
+          response?.data && typeof response.data === "object" && !Array.isArray(response.data)
+            ? (response.data as Record<string, unknown>)
+            : {};
+        const thread =
+          payload.thread && typeof payload.thread === "object"
+            ? (payload.thread as Record<string, unknown>)
+            : null;
+        const derivedTitle =
+          typeof thread?.title === "string" && thread.title.trim().length > 0
+            ? thread.title.trim()
+            : provisionalTitle;
+
+        handleThreadCreated(resolution.threadId, derivedTitle, {
+          tabId: originTabId,
+        });
+        return resolution.threadId;
+    } catch (error) {
+      console.error("[guardian] thread creation failed", error);
+      showToast("Failed to create thread.");
+      return null;
+    }
+    },
+    [auth.ready, authCanSend, effectiveThreadId, handleThreadCreated, showToast]
+  );
+
+  const ensureThreadIdForAttachments = useCallback(
+    async (bodyText: string) => createThreadFromComposer(bodyText),
+    [createThreadFromComposer]
+  );
+
+  const handleBranchThread = async () => {
+    if (effectiveThreadId == null) {
+      showToast("Thread is not persisted yet.");
+      return;
+    }
+    const suggestion = `${threadTitle || NEW_THREAD_TITLE} (branch)`;
+    const nextTitle = window.prompt("Branch thread title", suggestion);
+    if (nextTitle === null) return;
+    const trimmedTitle = nextTitle.trim();
+    try {
+      const payload = trimmedTitle ? { title: trimmedTitle } : {};
+      const res = await api.post(`/chat/${effectiveThreadId}/branch`, payload);
+      const data = res?.data ?? {};
+      const resolution = resolveBackendThreadIdFromResponse(data, {
+        endpoint: `POST /chat/${effectiveThreadId}/branch`,
+        method: "POST",
+        status:
+          typeof res?.status === "number" && Number.isFinite(res.status)
+            ? res.status
+            : null,
+        authPresent: hasRequestAuthCredential(),
+      });
+      const newThreadId = resolution.threadId;
+      if (newThreadId == null) {
+        throw new Error("Branch response missing thread id");
+      }
+      const responseTitle = typeof data?.title === "string" && data.title.trim().length > 0 ? data.title : undefined;
+      handleThreadCreated(newThreadId, responseTitle ?? trimmedTitle ?? suggestion);
+      emitThreadsRefresh("refresh", { reason: "branch", id: String(newThreadId), parentId: String(effectiveThreadId) });
+      setChatReloadVersion((v) => v + 1);
+      setTimeout(() => focusComposer(), 0);
+    } catch (err) {
+      console.error("[guardian] branch failed", err);
+      showToast("Failed to branch thread.");
+    }
+  };
+
+  const activeDocumentTiles = useMemo(
+    () => documentTilesByScope[documentTileScopeKey(activeSessionTabId)] ?? [],
+    [activeSessionTabId, documentTilesByScope]
+  );
+
+  const handleDocumentTileRemove = useCallback(
+    (tileId: string) => {
+      const scopeKey = documentTileScopeKey(activeSessionTabId);
+      setDocumentTilesByScope((previous) => {
+        const current = previous[scopeKey] ?? [];
+        const next = current.filter((tile) => tile.id !== tileId);
+        if (next.length === current.length) {
+          return previous;
+        }
+        return {
+          ...previous,
+          [scopeKey]: next,
+        };
+      });
+    },
+    [activeSessionTabId]
+  );
+
+  const buildDocumentContextMessage = useCallback(
+    async (bodyText: string, tiles: DocumentContextTile[]) => {
+      if (!tiles.length) {
+        return bodyText;
+      }
+
+      const loaded: DocumentContextContent[] = await Promise.all(
+        tiles.map(async (tile) => {
+          const record = await loadDocumentContentById(tile.id);
+          const content = String(record.content ?? "").trim();
+          if (!content) {
+            throw new Error(`Document "${tile.title}" has no readable content.`);
+          }
+          return {
+            tile: {
+              ...tile,
+              title: tile.title || record.title || "Untitled",
+              ext: tile.ext || record.ext,
+            },
+            content,
+          };
+        })
+      );
+
+      return serializeDocumentContextMessage(bodyText, loaded);
+    },
+    []
+  );
+
+  // Codex Entry draft flow — bound to the active thread.
+  const handleCodexDraftRequest = useCallback(
+    async (threadId: number, triggerMessageId?: number | null) => {
+      setCodexDraft(null); // clear any prior draft
+      try {
+        const response = await generateCodexDraft(threadId, triggerMessageId);
+        if (response.ok && response.draft) {
+          setCodexDraft(response.draft);
+        }
+      } catch (err) {
+        console.warn("[codex] draft generation failed", err);
+      }
+    },
+    [],
+  );
+
+  const handleCodexDraftSave = useCallback(
+    async (draft: CodexDraft) => {
+      await saveCodexEntry({
+        title: draft.title,
+        body: draft.body,
+        thread_id: draft.lineage.thread_id,
+        source_thread_id: draft.lineage.thread_id,
+        source_message_id: draft.lineage.last_source_message_id,
+        trigger_message_id: draft.lineage.trigger_message_id,
+        message_ids: draft.lineage.source_message_ids,
+        created_from: "slash_command",
+        retrieval_enabled: false,
+      });
+    },
+    [],
+  );
+
+  const handleCodexDraftDownload = useCallback(
+    (draft: CodexDraft) => {
+      downloadCodexDraftAsMarkdown(draft);
+    },
+    [],
+  );
+
+  const handleCodexDraftDismiss = useCallback(() => {
+    setCodexDraft(null);
+  }, []);
+
+  // Enhanced send handler with auto-thread creation
+  const handleSendMessage = async (
+    text: string,
+    options?: ComposerSendOptions
+  ) => {
+    /**
+     * Inject human consciousness into the thread's awareness stream.
+     *
+     * When no thread exists, this creates a new conversation consciousness
+     * container and establishes the temporal message flow. The provisional
+     * title becomes the thread's identity in the distributed awareness network.
+     */
+    const normalizedUserId = CANONICAL_SINGLE_USER_ID;
+    const hydrationState = getRuntimeConfigHydrationState();
+    if (hydrationState === "pending") {
+      showToast("Local runtime is still hydrating. Try again in a moment.");
+      return;
+    }
+    if (hydrationState === "failed") {
+      showToast(
+        "Local runtime handoff failed. Open desktop diagnostics and retry."
+      );
+      return;
+    }
+    if (!auth.ready) {
+      showToast("Authentication is not ready yet.");
+      return;
+    }
+    if (!authCanSend) {
+      showToast(
+        "Authentication required. Sign in or provide a dev key in local development."
+      );
+      return;
+    }
+    const targetThreadId = options?.threadIdOverride ?? effectiveThreadId;
+    const requestedProfileId = resolveProfileIdFromCommand(text);
+    const isProfileCommand =
+      targetThreadId != null && Boolean(requestedProfileId);
+    if (llmBackendUnavailable && !isProfileCommand) {
+      const title =
+        llmHealth.status === "misconfigured"
+          ? "LLM backend misconfigured."
+          : "LLM backend offline.";
+      showToast(`${title} ${llmStatusMessage}`);
+      void refreshLlmHealth();
+      return;
+    }
+    if (targetThreadId != null && isTurnLocked(targetThreadId)) {
+      notifyTurnLocked();
+      return;
+    }
+    if (
+      targetThreadId != null &&
+      isCompletionInFlight(targetThreadId)
+    ) {
+      notifyTurnLocked();
+      return;
+    }
+    if (targetThreadId != null && requestedProfileId) {
+      if (typeof window !== "undefined") {
+        sessionStorage.removeItem(`${DRAFT_KEY_PREFIX}${targetThreadId}`);
+      }
+      try {
+        await onSendMessage(text, options);
+        const switched = await switchThreadProfile(
+          targetThreadId,
+          requestedProfileId
+        );
+        if (switched) {
+          const selected =
+            availableProfiles.find(
+              (profile) => profile.id === requestedProfileId
+            ) ||
+            PROFILE_FALLBACK_OPTIONS.find(
+              (profile) => profile.id === requestedProfileId
+            );
+          const label = selected?.name || requestedProfileId;
+          await api.post(`/chat/${targetThreadId}/messages`, {
+            role: "assistant",
+            content: `Profile switched to ${label}. Next completion will use this profile.`,
+            user_id: normalizedUserId,
+          });
+          if (targetThreadId === effectiveThreadId) {
+            await refreshSnapshot(targetThreadId, "profile-switch");
+          }
+        }
+      } catch (error) {
+        console.error("[guardian] profile switch command failed", error);
+        showToast("Profile switch failed.");
+        throw error;
+      }
+      return;
+    }
+    const contentForSend = await buildDocumentContextMessage(
+      text,
+      activeDocumentTiles
+    );
+    if (!targetThreadId) {
+      let createdThreadId: number | null = null;
+      setPendingTurnLock(true);
+      try {
+        createdThreadId = await createThreadFromComposer(contentForSend);
+        if (createdThreadId == null) {
+          setPendingTurnLock(false);
+          return;
+        }
+        await activateThread(createdThreadId);
+        const synced = await syncThreadConfigBeforeSend(createdThreadId);
+        if (!synced) {
+          setPendingTurnLock(false);
+          setTurnLockForThread(createdThreadId, false);
+          return;
+        }
+
+        await api.post(`/chat/${createdThreadId}/messages`, {
+          role: "user",
+          content: contentForSend,
+          user_id: normalizedUserId,
+          project_id: workspaceProjectId ?? undefined,
+        });
+
+        emitThreadsRefresh("refresh", {
+          reason: "message",
+          id: String(createdThreadId),
+        });
+        setChatReloadVersion((v) => v + 1);
+
+        // Lock the new thread before requesting assistant completion.
+        setTurnLockForThread(createdThreadId, true);
+        setPendingTurnLock(false);
+
+        // Remove draft only after successful commit.
+        if (typeof window !== "undefined") {
+          sessionStorage.removeItem(`${DRAFT_KEY_PREFIX}${createdThreadId}`);
+        }
+
+        // Complete the thread and refresh.
+        startInferenceForThread(createdThreadId);
+
+        // Detect codex_entry command and request a draft
+        if (options?.slashIntent?.commandId === "codex_entry") {
+          void handleCodexDraftRequest(createdThreadId);
+        }
+
+        const completionOutcome = await completeThread(createdThreadId, options);
+        if (completionOutcome !== "ok" && completionOutcome !== "inflight") {
+          setTurnLockForThread(createdThreadId, false);
+          if (completionOutcome === "failed") {
+            throw new Error("Assistant response failed.");
+          }
+          return;
+        }
+      } catch (error) {
+        console.error("Failed to create thread or send message:", error);
+        setPendingTurnLock(false);
+        if (createdThreadId != null) {
+          setTurnLockForThread(createdThreadId, false);
+        }
+        throw error;
+      }
+    } else {
+      if (typeof window !== "undefined") {
+        sessionStorage.removeItem(`${DRAFT_KEY_PREFIX}${targetThreadId}`);
+      }
+      setTurnLockForThread(targetThreadId, true);
+      // Thread exists, just send the message via parent callback
+      try {
+        const synced = await syncThreadConfigBeforeSend(targetThreadId);
+        if (!synced) {
+          setTurnLockForThread(targetThreadId, false);
+          return;
+        }
+        if (targetThreadId !== effectiveThreadId) {
+          await api.post(`/chat/${targetThreadId}/messages`, {
+            role: "user",
+            content: contentForSend,
+            user_id: normalizedUserId,
+            project_id: workspaceProjectId ?? undefined,
+          });
+          emitThreadsRefresh("refresh", {
+            reason: "message",
+            id: String(targetThreadId),
+          });
+          setChatReloadVersion((v) => v + 1);
+        } else {
+          await onSendMessage(contentForSend, options);
+          await refreshSnapshot(targetThreadId, "user-send");
+        }
+
+        // Fire-and-forget completion a beat later so the just-sent message is persisted
+        startInferenceForThread(targetThreadId);
+
+        // Detect codex_entry command and request a draft
+        if (options?.slashIntent?.commandId === "codex_entry") {
+          void handleCodexDraftRequest(targetThreadId);
+        }
+
+        setTimeout(() => {
+          if (targetThreadId == null) return;
+          void (async () => {
+            const completionOutcome = await completeThread(targetThreadId, options);
+            if (completionOutcome !== "ok" && completionOutcome !== "inflight") {
+              setTurnLockForThread(targetThreadId, false);
+              if (completionOutcome === "failed") {
+                showToast("Assistant response failed.");
+              }
+            }
+          })();
+        }, 100);
+      } catch (error) {
+        setTurnLockForThread(targetThreadId, false);
+        throw error;
+      }
+    }
+  };
+
+  // Depth selector labels with consciousness metaphors
+  const depthLabels: Record<DepthMode, string> = {
+    shallow: "Shallow",
+    normal: "Normal",
+    deep: "Deep",
+    diagnostic: "Diagnostic",
+  };
+
+  const depthDescriptions: Record<DepthMode, string> = {
+    shallow: "Fast, ephemeral awareness",
+    normal: "Situational recall + semantic grounding",
+    deep: "Rich memory inside the selected source boundary",
+    diagnostic: "System introspection + trace visibility",
+  };
+  const sourceOptions = [
+    {
+      value: "project",
+      label: "Project",
+      description:
+        "Current thread first, then this project if more context is needed.",
+    },
+    {
+      value: "personal_knowledge",
+      label: "Personal Knowledge",
+      description:
+        "Current thread first, then your broader knowledge across projects.",
+    },
+  ];
+
+  const promptCostStatus: PromptCostStatus =
+    promptCostSummary?.threshold?.status ?? "unknown";
+  const showPromptCostDot =
+    promptCostStatus === "warn" || promptCostStatus === "hard";
+  const ragTraceUiEnabled = isRagTraceUIEnabled();
+  const depthOptions = (Object.keys(depthLabels) as DepthMode[]).map((mode) => ({
+    value: mode,
+    label: depthLabels[mode],
+    description: depthDescriptions[mode],
+  }));
+  const composerInferenceState =
+    numericThreadId != null &&
+    inferenceRequest.state.threadId === numericThreadId
+      ? inferenceRequest.state
+      : createIdleInferenceRequestState();
+  const composerInferenceSnapshot = useMemo(
+    () => describeInferenceRequestState(composerInferenceState),
+    [composerInferenceState]
+  );
+  const handleCancelInference = () => {
+    const releaseThreadId =
+      inferenceRequest.state.threadId ??
+      completionState.activeThreadId ??
+      effectiveThreadId;
+    void inferenceRequest.requestCancel();
+    releaseTurnLease(releaseThreadId, {
+      clearCompletion: true,
+      clearInference: true,
+    });
+  };
+  const handleSwitchToNoThink = () => {
+    if (effectiveThreadId == null) return;
+    onSessionInferenceModeChange?.("no_think");
+    const selection = resolveCompletionSelection({
+      reasoningMode: "no_think",
+    });
+    pendingFastRetryRef.current = {
+      threadId: effectiveThreadId,
+      providerId: selection.providerId,
+      modelId: selection.modelId,
+    };
+    void inferenceRequest.requestCancel().then((ok) => {
+      if (!ok) {
+        pendingFastRetryRef.current = null;
+      }
+    });
+  };
+
+  const emitMoveUndoToast = (
+    fromProjectId: number | null,
+    fromLabel: string,
+    toLabel: string
+  ) => {
+    if (effectiveThreadId == null) return;
+    try {
+      window.dispatchEvent(
+        new CustomEvent("cfy:toast", {
+          detail: {
+            message: `Moved thread from ${fromLabel} → ${toLabel}.`,
+            actionLabel: "Undo",
+            timeoutMs: 10000,
+            onAction: () => {
+              void (async () => {
+                try {
+                  if (fromProjectId == null || effectiveThreadId == null) return;
+                  await moveChatThread(effectiveThreadId, fromProjectId);
+                  emitThreadsRefresh("move", {
+                    id: String(effectiveThreadId),
+                    project_id: fromProjectId,
+                  });
+                } catch (error) {
+                  console.warn("[guardian] undo move failed", error);
+                }
+              })();
+            },
+          },
+        })
+      );
+    } catch {
+      // no-op
+    }
+  };
+  const composerProjectId = (() => {
+    const candidate =
+      workspaceProjectId != null
+        ? Number(workspaceProjectId)
+        : activeThread.projectId != null
+          ? Number(activeThread.projectId)
+          : null;
+    return Number.isFinite(candidate) ? candidate : null;
+  })();
+
+  const headerActions = (
+    <>
+      <div
+        ref={voicePanelRef}
+        className="relative"
+        data-testid="voice-settings-popover-anchor"
+      >
+        <button
+          type="button"
+          className="icon-inline relative"
+          aria-label="Voice settings"
+          aria-expanded={voicePanelOpen}
+          aria-controls="voice-settings-popover"
+          onClick={() => setVoicePanelOpen((previous) => !previous)}
+          style={{
+            borderRadius: "var(--radius-micro)",
+            ...mobileHeaderIconTouchTargetStyle,
+          }}
+          data-testid="voice-settings-trigger"
+        >
+          <Mic2 className="h-5 w-5" />
+          {voicePlaybackEnabledPreference || voiceTurnEnabledPreference ? (
+            <span
+              className="absolute right-[0.1rem] top-[0.1rem] h-1.5 w-1.5 rounded-full bg-emerald-400"
+              aria-hidden="true"
+            />
+          ) : null}
+        </button>
+        {voicePanelOpen ? (
+          <div
+            id="voice-settings-popover"
+            role="dialog"
+            aria-label="Voice settings"
+            data-testid="voice-settings-popover"
+            className="absolute right-0 top-[calc(100%+0.4rem)] z-30 w-[19rem] max-w-[calc(100vw-1rem)] rounded-lg border px-3 py-3 shadow-xl"
+            style={{
+              borderColor: "var(--panel-border)",
+              background: "var(--panel-sheet)",
+              color: "var(--text)",
+            }}
+          >
+            <div className="text-[10px] font-medium uppercase tracking-[0.18em] opacity-70">
+              Voice
+            </div>
+            <div className="mt-2 space-y-3">
+              <div>
+                <div className="mb-1 text-xs font-medium">Playback</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={voicePlaybackEnabledPreference ? "default" : "ghost"}
+                    disabled={!voiceReadAloudSupported}
+                    onClick={() => setVoicePlaybackEnabledPreference(true)}
+                    className="justify-center"
+                  >
+                    On
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={!voicePlaybackEnabledPreference ? "default" : "ghost"}
+                    onClick={() => setVoicePlaybackEnabledPreference(false)}
+                    className="justify-center"
+                  >
+                    Off
+                  </Button>
+                </div>
+                {!voiceReadAloudSupported ? (
+                  <div className="mt-1 text-[11px] opacity-65">
+                    Read aloud is unavailable on this runtime.
+                  </div>
+                ) : null}
+              </div>
+              <div>
+                <div className="mb-1 text-xs font-medium">Voice turns</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={voiceTurnEnabledPreference ? "default" : "ghost"}
+                    disabled={!voiceTurnBasedSupported}
+                    onClick={() => setVoiceTurnEnabledPreference(true)}
+                    className="justify-center"
+                  >
+                    On
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={!voiceTurnEnabledPreference ? "default" : "ghost"}
+                    onClick={() => setVoiceTurnEnabledPreference(false)}
+                    className="justify-center"
+                  >
+                    Off
+                  </Button>
+                </div>
+                {!voiceTurnBasedSupported ? (
+                  <div className="mt-1 text-[11px] opacity-65">
+                    Voice turns are unavailable on this runtime.
+                  </div>
+                ) : null}
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium" htmlFor="voice-settings-voice">
+                  Voice
+                </label>
+                <select
+                  id="voice-settings-voice"
+                  className="h-9 w-full rounded-md border bg-[var(--panel-bg)]/80 px-3 text-sm outline-none focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{ borderColor: "var(--panel-border)", color: "var(--text)" }}
+                  value={selectedVoiceValue}
+                  disabled={!voiceReadAloudSupported && !voiceTurnBasedSupported}
+                  onChange={(event) => setSelectedVoice(event.target.value)}
+                >
+                  {voiceModeOptions.map((voice) => (
+                    <option key={voice} value={voice}>
+                      {voice}
+                    </option>
+                  ))}
+                </select>
+                <div className="mt-1 text-[11px] opacity-65">
+                  {voiceCapabilities.provider_default
+                    ? `Provider: ${voiceCapabilities.provider_default}`
+                    : "Using the runtime voice provider."}
+                </div>
+              </div>
+              <label className="flex items-center justify-between gap-3 text-xs">
+                <span className="font-medium">Auto-read new replies</span>
+                <input
+                  type="checkbox"
+                  checked={autoReadEnabled}
+                  disabled={!voiceReadAloudEnabled}
+                  onChange={(event) => setAutoReadEnabled(event.target.checked)}
+                />
+              </label>
+            </div>
+          </div>
+        ) : null}
+      </div>
+      <div
+        ref={promptCostPopoverRef}
+        className="relative"
+        data-testid="prompt-cost-popover-anchor"
+      >
+        <button
+          type="button"
+          className="icon-inline relative"
+          aria-label="Prompt cost details"
+          aria-expanded={promptCostPopoverOpen}
+          aria-controls="prompt-cost-popover"
+          onClick={handlePromptCostToggle}
+          style={{
+            borderRadius: "var(--radius-micro)",
+            ...mobileHeaderIconTouchTargetStyle,
+          }}
+          data-testid="prompt-cost-trigger"
+        >
+          <Zap className="h-5 w-5" />
+          {showPromptCostDot ? (
+            <span
+              className={`absolute right-[0.1rem] top-[0.1rem] h-1.5 w-1.5 rounded-full ${
+                promptCostStatus === "hard" ? "bg-rose-400" : "bg-amber-400"
+              }`}
+              aria-hidden="true"
+            />
+          ) : null}
+        </button>
+        {promptCostPopoverOpen ? (
+          <div
+            id="prompt-cost-popover"
+            role="dialog"
+            aria-label="Prompt cost"
+            data-testid="prompt-cost-popover"
+            className="absolute right-0 top-[calc(100%+0.4rem)] z-30 min-w-[16rem] rounded-lg border px-3 py-2 shadow-xl"
+            style={{
+              borderColor: "var(--panel-border)",
+              background: "var(--panel-sheet)",
+              color: "var(--text)",
+            }}
+          >
+            <PromptCostIndicator summary={promptCostSummary} variant="popover" />
+          </div>
+        ) : null}
+      </div>
+        <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            className="icon-inline"
+            aria-label="Thread actions"
+            style={{
+              borderRadius: "var(--radius-micro)",
+              ...mobileHeaderIconTouchTargetStyle,
+            }}
+          >
+            <MoreVertical className="h-5 w-5" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem
+            onClick={async () => {
+              if (effectiveThreadId == null) return alert("Thread is not persisted yet");
+              const next = window.prompt("Rename thread", threadTitle || "");
+              const title = next?.trim();
+              if (!title || title === threadTitle) return;
+              setThreadTitle(title);
+              emitThreadsRefresh("rename", { id: String(effectiveThreadId), title });
+              try {
+                await api.patch(`/chat/${effectiveThreadId}`, { title });
+              } catch (e) {
+                console.warn(e);
+                alert("Rename failed.");
+              }
+            }}
+          >
+            Rename Thread
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={handleBranchThread}
+            title="Create a new thread that inherits a summary/briefing and continue with a different model."
+          >
+            <div className="flex flex-col flex-1 min-h-0">
+              <div className="font-medium">Branch Thread</div>
+              <div className="text-xs opacity-70">
+                Create a new thread that inherits a summary/briefing and continue with a different model.
+              </div>
+            </div>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={async () => {
+              if (effectiveThreadId == null) return alert("Thread is not persisted yet");
+              const pidRaw = window.prompt("Add to project id (blank to cancel)", "");
+              if (pidRaw == null || pidRaw === "") return;
+              const pid = Number(pidRaw);
+              if (!Number.isFinite(pid)) return alert("Invalid project id");
+              try {
+                const fromProjectId = activeThread.projectId != null ? Number(activeThread.projectId) : null;
+                const fromLabel = activeThread.projectName ?? (fromProjectId != null ? `Project #${fromProjectId}` : "No Project");
+                await moveChatThread(effectiveThreadId, pid);
+                emitThreadsRefresh("move", { id: String(effectiveThreadId), project_id: pid });
+                emitMoveUndoToast(fromProjectId, fromLabel, `Project #${pid}`);
+              } catch (e) {
+                console.warn(e);
+                alert("Add failed.");
+              }
+            }}
+          >
+            Add to Project…
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={async () => {
+              if (effectiveThreadId == null) return alert("Thread is not persisted yet");
+              const pidRaw = window.prompt("Move to project id (blank to cancel)", "");
+              if (pidRaw == null || pidRaw === "") return;
+              const pid = Number(pidRaw);
+              if (!Number.isFinite(pid)) return alert("Invalid project id");
+              try {
+                const fromProjectId = activeThread.projectId != null ? Number(activeThread.projectId) : null;
+                const fromLabel = activeThread.projectName ?? (fromProjectId != null ? `Project #${fromProjectId}` : "No Project");
+                await moveChatThread(effectiveThreadId, pid);
+                emitThreadsRefresh("move", { id: String(effectiveThreadId), project_id: pid });
+                emitMoveUndoToast(fromProjectId, fromLabel, `Project #${pid}`);
+              } catch (e) {
+                console.warn(e);
+                alert("Move failed.");
+              }
+            }}
+          >
+            Move to Project…
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={async () => {
+              if (effectiveThreadId == null) return alert("Thread is not persisted yet");
+              const generalProjectId = readStoredGeneralProjectId();
+              if (generalProjectId == null) return alert("General project not configured");
+              try {
+                const fromProjectId = activeThread.projectId != null ? Number(activeThread.projectId) : null;
+                const fromLabel = activeThread.projectName ?? (fromProjectId != null ? `Project #${fromProjectId}` : "No Project");
+                await moveChatThread(effectiveThreadId, generalProjectId);
+                emitThreadsRefresh("move", {
+                  id: String(effectiveThreadId),
+                  project_id: generalProjectId,
+                });
+                emitMoveUndoToast(fromProjectId, fromLabel, "General");
+              } catch (e) {
+                console.warn(e);
+                alert("Move to General failed.");
+              }
+            }}
+          >
+            Move to General
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={async () => {
+              if (effectiveThreadId == null) return alert("Thread is not persisted yet");
+              if (!onArchiveThread) return alert("Archiving is unavailable in this view");
+              if (!window.confirm("Archive this thread? It will be hidden from the sidebar.")) return;
+              try {
+                await onArchiveThread(effectiveThreadId);
+                emitThreadsRefresh("archive", { id: String(effectiveThreadId), archived: true });
+                setCurrentThreadId(null);
+                setThreadTitle(NEW_THREAD_TITLE);
+                if (typeof window !== "undefined") {
+                  window.history.replaceState({}, "", `/chat`);
+                }
+              } catch (err) {
+                console.warn("[guardian] archive failed", err);
+                alert("Archive failed.");
+              }
+            }}
+          >
+            Archive Thread
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={async () => {
+              if (effectiveThreadId == null) return alert("Thread is not persisted yet");
+              if (!window.confirm("Delete this thread? This cannot be undone.")) return;
+              try {
+                await api.delete(`/chat/${effectiveThreadId}`);
+                emitThreadsRefresh("delete", { id: String(effectiveThreadId) });
+                setCurrentThreadId(null);
+                setThreadTitle(NEW_THREAD_TITLE);
+                if (typeof window !== "undefined") {
+                  window.history.replaceState({}, "", `/chat`);
+                }
+              } catch (e: any) {
+                console.warn(e);
+                alert("Delete failed. Please try again.");
+              }
+            }}
+          >
+            Delete Thread
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={async () => {
+              if (effectiveThreadId == null) return alert("Thread is not persisted yet");
+              const nextProfile = window.prompt("Switch to profile id", resolvedProfile.id || "default");
+              const profileId = (nextProfile || "").trim();
+              if (!profileId) return;
+              await switchThreadProfile(effectiveThreadId, profileId);
+            }}
+          >
+            Switch profile…
+          </DropdownMenuItem>
+          {ragTraceUiEnabled ? (
+            <DropdownMenuItem
+              onClick={() => {
+                if (ragTraceThreadId == null) {
+                  alert("Thread is not persisted yet");
+                  return;
+                }
+                setRagTraceOpen(true);
+              }}
+            >
+              View RAG Trace
+            </DropdownMenuItem>
+          ) : null}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </>
+  );
+
+  const body = (
+    <div className="relative flex h-full w-full min-h-0 flex-col bg-transparent">
+      {/* Single header rail */}
+      <header className={`shrink-0 z-20 py-2 ${CHAT_LANE_GUTTER_CLASS}`}>
+      <div
+          className="relative flex items-center gap-2 px-4 py-2 flex-nowrap w-full"
+          >
+          <div className="flex items-center gap-2 shrink-0">
+            {onSidebarToggle && (
+              <button
+                type="button"
+                className="icon-inline"
+                aria-label={isSidebarVisible ? "Hide sidebar" : "Show sidebar"}
+                onClick={onSidebarToggle}
+                disabled={!onSidebarToggle}
+                style={{
+                  borderRadius: "999px",
+                  border: "1px solid color-mix(in oklab, var(--panel-border) 78%, transparent)",
+                  background:
+                    "linear-gradient(180deg, rgba(255,255,255,0.14), rgba(255,255,255,0.03)), color-mix(in oklab, var(--panel-bg) 70%, transparent)",
+                  boxShadow:
+                    "inset 0 1px 0 rgba(255,255,255,0.18), 0 8px 18px rgba(0,0,0,0.08)",
+                  padding: "0.5rem",
+                }}
+              >
+                <ChevronRight
+                  className={`h-5 w-5 transition-transform duration-200 ${
+                    isSidebarVisible ? "rotate-180" : ""
+                  }`}
+                />
+              </button>
+            )}
+          </div>
+
+          <div className="flex-1 min-w-0">
+            <SessionRail
+              tabs={sessionTabs}
+              activeTabId={activeSessionTabId}
+              isCloud={resolvedProfile.mode === "cloud" ? true : resolvedProfile.mode === "local" ? false : undefined}
+              showTabs={sessionTabs.length > 1}
+              onActivateTab={handleSessionTabActivateRequest}
+              onCloseTab={(tabId) => onSessionTabClose?.(tabId)}
+              onOpenTab={handleSessionTabOpenRequest}
+            />
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            {headerActions}
+          </div>
+        </div>
+      </header>
+
+      {llmBackendUnavailable && (
+        <div
+          className={`mt-2 rounded-lg border px-3 py-2 text-xs ${CHAT_LANE_STAGE_GUTTER_CLASS}`}
+          style={{
+            borderColor: "var(--panel-border)",
+            color: "var(--text)",
+            background: "color-mix(in oklab, var(--panel-bg) 88%, #f59e0b 12%)",
+          }}
+        >
+          <div className="font-semibold">
+            {llmHealth.status === "misconfigured" ? "LLM backend misconfigured" : "LLM backend offline"}
+          </div>
+          <div className="mt-1 opacity-90">{llmStatusMessage}</div>
+          <div className="mt-1 flex items-center gap-2 opacity-80">
+            <span>
+              Provider: {llmHealth.provider || "unknown"}
+              {llmHealth.model ? ` · Model: ${llmHealth.model}` : ""}
+            </span>
+            <button
+              type="button"
+              className="underline underline-offset-2"
+              title="Open provider selector"
+              onClick={requestProviderSwitch}
+            >
+              Switch provider
+            </button>
+            <button
+              type="button"
+              className="underline underline-offset-2"
+              onClick={() => {
+                void refreshLlmHealth();
+              }}
+            >
+              Recheck
+            </button>
+          </div>
+          {cloudProvidersDisabled ? (
+            <div className="mt-1 opacity-80">Cloud providers disabled by config.</div>
+          ) : null}
+          {runtimeHealthDiagnosticLines.length > 0 ? (
+            <details className="mt-2 rounded-md border border-dashed border-[color:var(--panel-border)] px-2 py-1 text-[11px]">
+              <summary className="cursor-pointer select-none opacity-80">
+                Technical details
+              </summary>
+              <div className="mt-2 flex flex-col gap-1 font-mono text-[10px] leading-4 opacity-85">
+                {runtimeHealthDiagnosticLines.map((line) => (
+                  <div key={line}>{line}</div>
+                ))}
+              </div>
+            </details>
+          ) : null}
+        </div>
+      )}
+
+      {threadCreationIssue ? (
+        <div
+          data-testid="thread-id-resolution-banner"
+          className={`mt-2 rounded-lg border px-3 py-2 text-xs ${CHAT_LANE_STAGE_GUTTER_CLASS}`}
+          style={{
+            borderColor: "var(--panel-border)",
+            color: "var(--text)",
+            background:
+              "color-mix(in oklab, var(--panel-bg) 88%, #f59e0b 12%)",
+          }}
+        >
+          <div className="font-semibold">Thread id missing from response</div>
+          <div className="mt-1 opacity-90">
+            Guardian could not resolve a durable thread id from the backend response.
+          </div>
+          <details className="mt-2 rounded-md border border-dashed border-[color:var(--panel-border)] px-2 py-1 text-[11px]">
+            <summary className="cursor-pointer select-none opacity-80">
+              Technical details
+            </summary>
+            <div className="mt-2 flex flex-col gap-1 font-mono text-[10px] leading-4 opacity-85">
+              {threadCreationIssueLines.map((line) => (
+                <div key={line}>{line}</div>
+              ))}
+            </div>
+          </details>
+        </div>
+      ) : null}
+
+      {/* Messages region - Flex 1, scrolls independently */}
+      <div className="relative flex flex-col flex-1 min-h-0 overflow-hidden">
+        {effectiveThreadId != null ? (
+          <div
+            data-testid="chat-message-region"
+            data-inference-delayed={composerInferenceSnapshot.isDelayed ? "true" : "false"}
+            data-inference-state={composerInferenceSnapshot.canonicalState}
+            className="flex flex-1 min-h-0 min-w-0 overflow-hidden"
+          >
+            <ChatView
+              key={effectiveThreadId}
+              threadId={effectiveThreadId}
+              guardianName={guardianName}
+              messages={messages}
+              loading={chatLoading}
+              error={chatError}
+              hasMore={chatHasMore}
+              onLoadOlderMessages={() => loadOlderMessages(effectiveThreadId)}
+              reloadVersion={chatReloadVersion}
+              completionState={completionState}
+              endCompletion={endCompletion}
+              className="flex flex-col flex-1 min-h-0"
+              bottomPadding={composerShellReserve}
+              autoReadEnabled={autoReadEnabled}
+              depthMode={depth}
+              profileId={resolvedProfile.id}
+              voiceReadAloudEnabled={voiceReadAloudEnabled}
+              voiceProvider={voiceCapabilities.provider_default}
+              voiceSelectedVoice={selectedVoiceValue}
+              voiceDefaultVoice={voiceCapabilities.voice_default}
+              voiceCapabilitiesFailed={voiceCapabilitiesFailed}
+              inferenceState={composerInferenceState}
+              streamingDraft={streamingDraft}
+              onCancelInference={handleCancelInference}
+              onSwitchToFast={handleSwitchToNoThink}
+              codexDraft={codexDraft}
+              onCodexDraftSave={handleCodexDraftSave}
+              onCodexDraftDownload={handleCodexDraftDownload}
+              onCodexDraftDismiss={handleCodexDraftDismiss}
+            />
+          </div>
+        ) : (
+          <div
+            className="flex flex-1 items-center justify-center px-[var(--card-pad)] text-sm opacity-70"
+            style={{ color: "var(--muted)" }}
+          >
+            {preferredName
+              ? `Welcome back, ${preferredName}. Let’s get started.`
+              : "New thread ready. Start typing below."}
+          </div>
+        )}
+      </div>
+
+      <div className="shrink-0 z-20 mt-2 flex w-full justify-center">
+        <div
+          ref={composerShellRef}
+          data-testid="composer-shell"
+          className={`mx-auto w-full max-w-full ${CHAT_LANE_MAX_WIDTH_CLASS} rounded-[24px] border shadow-2xl backdrop-blur-xl flex flex-col overflow-hidden`}
+          style={{
+            ...mobileComposerShellMotionStyle,
+            maxWidth: CHAT_LANE_MAX_WIDTH,
+            borderColor: "var(--panel-border)",
+            background: "color-mix(in oklab, var(--panel-bg) 95%, black)", // Deep opaque glass
+            clipPath: "inset(0 round 24px)",
+            isolation: "isolate",
+            minHeight: "140px",
+            maxHeight: mobileShellProfile.chat.composer.shellMaxHeight,
+          }}
+        >
+          <div className="flex h-full min-h-0 flex-col">
+            <div
+              data-testid="composer-conversation-lane"
+              className={`mx-auto w-full max-w-full ${CHAT_LANE_MAX_WIDTH_CLASS}`}
+              style={{
+                maxWidth: CHAT_LANE_MAX_WIDTH,
+              }}
+            >
+              <GuardianThreadApprovalRail
+                className="mb-3"
+                onTellGuardianWhatToDoInstead={handleTellGuardianWhatToDoInstead}
+                reloadSignal={chatReloadVersion}
+                threadId={effectiveThreadId ?? undefined}
+              />
+              <Composer
+                onSend={handleSendMessage}
+                ensureThreadIdForAttachments={ensureThreadIdForAttachments}
+                prefill={externalPrefill ?? prefill}
+                onPrefillConsumed={() => {
+                  setExternalPrefill(undefined);
+                  onPrefillConsumed?.();
+                }}
+                documentTiles={activeDocumentTiles}
+                onDocumentTileRemove={handleDocumentTileRemove}
+                threadId={effectiveThreadId ?? undefined}
+                projectId={composerProjectId}
+                projectName={activeThread.projectName ?? null}
+                draftValue={activeDraft}
+                draftScopeKey={activeSessionTabId ?? "global"}
+                onDraftValueChange={onSessionDraftChange}
+                activeProviderId={selectedProvider?.id ?? activeProviderId}
+                providerOptions={providerOptions}
+                providerOpenSignal={providerMenuOpenSignal}
+                onProviderChange={(providerId) => {
+                  const activeRequestThreadId =
+                    completionState.activeThreadId ??
+                    inferenceRequest.state.threadId ??
+                    effectiveThreadId;
+
+                  const currentProviderId =
+                    selectedProvider?.id ?? activeProviderId ?? null;
+
+                  const providerChanged = providerId !== currentProviderId;
+
+                  if (
+                    providerChanged &&
+                    activeRequestThreadId != null &&
+                    isTurnLocked(activeRequestThreadId)
+                  ) {
+                    void inferenceRequest.requestCancel();
+                    releaseTurnLease(activeRequestThreadId, {
+                      clearCompletion: true,
+                      clearInference: true,
+                    });
+                  }
+
+                  const nextProvider =
+                    catalogProviders.find((p) => p.id === providerId) ?? null;
+                  const nextModelId =
+                    nextProvider?.models.find(isChatSelectableModel)?.id ?? null;
+
+                  const nextSelectedModel =
+                    selectedModel != null
+                      ? nextProvider?.models.find(
+                          (model) => model.id === selectedModel.id
+                        ) ?? null
+                      : null;
+
+                  const nextSnapshot = mergeThreadConfigSnapshot({
+                    providerId,
+                    modelId:
+                      !nextSelectedModel ||
+                      !isChatSelectableModel(nextSelectedModel)
+                        ? nextModelId ?? selectedModel?.id ?? activeModelId ?? "default"
+                        : nextSelectedModel.id,
+                  });
+
+                  if (nextSnapshot) {
+                    void saveThreadConfigSnapshot(nextSnapshot);
+                  }
+                }}
+                activeModelId={selectedModel?.id ?? activeModelId}
+                selectedModelCatalog={selectedModel}
+                modelOptions={modelOptions}
+                onModelChange={(modelId) => {
+                  const nextSnapshot = mergeThreadConfigSnapshot({
+                    modelId,
+                  });
+                  if (nextSnapshot) {
+                    void saveThreadConfigSnapshot(nextSnapshot);
+                  }
+                }}
+                activeInferenceMode={effectiveInferenceMode}
+                inferenceModeOptions={inferenceModeOptions}
+                onInferenceModeChange={(mode) => {
+                  const nextSnapshot = mergeThreadConfigSnapshot({
+                    inferenceMode: threadConfigInferenceModeFromComposer(
+                      mode
+                    ),
+                  });
+                  if (nextSnapshot) {
+                    void saveThreadConfigSnapshot(nextSnapshot);
+                  }
+                }}
+                currentRequestState={completionState.requestState}
+                providerRuntimeState={providerRuntimeState}
+                sourceMode={sourceMode}
+                sourceOptions={sourceOptions}
+                onSourceModeChange={(mode) => {
+                  const nextSnapshot = mergeThreadConfigSnapshot({
+                    retrievalSource: mode,
+                  });
+                  if (nextSnapshot) {
+                    void saveThreadConfigSnapshot(nextSnapshot);
+                  }
+                }}
+                onCatalogRefresh={refreshCatalog}
+                depthMode={depth}
+                depthOptions={depthOptions}
+                onDepthModeChange={setDepth}
+                onVoiceTurn={
+                  voiceTurnBasedEnabled
+                    ? () => {
+                        if (effectiveThreadId == null) {
+                          alert(
+                            "Create or open a thread before starting a voice turn."
+                          );
+                          return;
+                        }
+                        voiceFileInputRef.current?.click();
+                      }
+                    : undefined
+                }
+                voiceTurnLabel={
+                  voiceUploading ? "Processing voice…" : "Upload voice turn"
+                }
+              />
+              {voiceTurnBasedEnabled ? (
+                <input
+                  ref={voiceFileInputRef}
+                  type="file"
+                  accept={voiceUploadAccept}
+                  className="hidden"
+                  onChange={async (event) => {
+                    const file = event.target.files?.[0];
+                    event.currentTarget.value = "";
+                    if (!file) return;
+                    if (effectiveThreadId == null) {
+                      alert("Create or open a thread before starting a voice turn.");
+                      return;
+                    }
+
+                    const normalizedMime = String(file.type || "")
+                      .trim()
+                      .toLowerCase();
+
+                    if (
+                      normalizedMime &&
+                      supportedVoiceInputMime.length > 0 &&
+                      !supportedVoiceInputMime.includes(normalizedMime)
+                    ) {
+                      alert(`Unsupported audio type: ${normalizedMime}`);
+                      return;
+                    }
+
+                    if (
+                      voiceUploadLimitBytes != null &&
+                      file.size > voiceUploadLimitBytes
+                    ) {
+                      const limitMb = (
+                        voiceUploadLimitBytes /
+                        (1024 * 1024)
+                      ).toFixed(1);
+                      alert(`Audio file too large. Max ${limitMb} MB.`);
+                      return;
+                    }
+
+                    setVoiceUploading(true);
+                    try {
+                      const form = new FormData();
+                      form.append("thread_id", String(effectiveThreadId));
+                      form.append("audio_file", file);
+                      form.append("tts_enabled", "true");
+                      if (voiceCapabilities.provider_default) {
+                        form.append("tts_provider", voiceCapabilities.provider_default);
+                      }
+                      if (selectedVoiceValue) {
+                        form.append("voice", selectedVoiceValue);
+                      }
+                      await api.post("/voice/turn", form, {
+                        headers: { "Content-Type": "multipart/form-data" },
+                        timeout: 180000,
+                      });
+                      triggerReload();
+                    } catch (error) {
+                      console.warn("[guardian] voice turn failed", error);
+                      alert(
+                        "Voice turn failed. Check backend voice configuration."
+                      );
+                    } finally {
+                      setVoiceUploading(false);
+                    }
+                  }}
+                />
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  if (bare) {
+    return (
+      <>
+        {/* ChatView owns the scroll container; this wrapper just constrains layout. */}
+        <div className="relative flex flex-col flex-1 min-h-0 overflow-hidden">
+          <div
+            data-testid="guardian-shell"
+            className={`relative mx-auto flex h-full w-full min-h-0 flex-col ${GUARDIAN_SHELL_MAX_WIDTH_CLASS}`}
+            style={{ maxWidth: GUARDIAN_SHELL_MAX_WIDTH }}
+          >
+            {body}
+          </div>
+        </div>
+        <RAGTracePanel
+          open={ragTraceOpen}
+          onOpenChange={setRagTraceOpen}
+          threadId={ragTraceThreadId}
+        />
+      </>
+    );
+  }
+
+  return (
+    <>
+      <FrameCard
+        data-testid="guardian-shell"
+        className={`mx-auto flex h-full min-h-0 min-w-0 w-full flex-1 flex-col ${GUARDIAN_SHELL_MAX_WIDTH_CLASS}`}
+        style={{ maxWidth: GUARDIAN_SHELL_MAX_WIDTH }}
+        hoverPop
+      >
+        <div className="relative flex flex-col w-full h-full">
+          {body}
+        </div>
+      </FrameCard>
+      <RAGTracePanel
+        open={ragTraceOpen}
+        onOpenChange={setRagTraceOpen}
+        threadId={ragTraceThreadId}
+      />
+    </>
+  );
+}
+
+export default GuardianChat;

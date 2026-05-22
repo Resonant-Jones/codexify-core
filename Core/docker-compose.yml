@@ -1,0 +1,1040 @@
+name: codexify
+
+x-postgres-env: &postgres_env
+  POSTGRES_USER: ${POSTGRES_USER:-codexify}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-codexify}
+  POSTGRES_DB: ${POSTGRES_DB:-Codexify}
+  PGHOST: db
+  PGPORT: "5432"
+  PGUSER: ${POSTGRES_USER:-codexify}
+  PGPASSWORD: ${POSTGRES_PASSWORD:-codexify}
+  PGDATABASE: ${POSTGRES_DB:-Codexify}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-codexify}:${POSTGRES_PASSWORD:-codexify}@db:5432/${POSTGRES_DB:-Codexify}
+  GUARDIAN_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-codexify}:${POSTGRES_PASSWORD:-codexify}@db:5432/${POSTGRES_DB:-Codexify}
+  GUARDIAN_DB_URL: postgresql://${POSTGRES_USER:-codexify}:${POSTGRES_PASSWORD:-codexify}@db:5432/${POSTGRES_DB:-Codexify}
+  GUARDIAN_DB_DSN: postgresql://${POSTGRES_USER:-codexify}:${POSTGRES_PASSWORD:-codexify}@db:5432/${POSTGRES_DB:-Codexify}
+  GUARDIAN_CHATLOG_DSN: postgresql://${POSTGRES_USER:-codexify}:${POSTGRES_PASSWORD:-codexify}@db:5432/${POSTGRES_DB:-Codexify}
+
+services:
+  db:
+    image: postgres:15
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U \"$${POSTGRES_USER:-codexify}\" -d \"$${POSTGRES_DB:-Codexify}\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports: ["5433:5432"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_server_default__listen__address: 0.0.0.0
+      # Let the official image handle auth via NEO4J_AUTH (no custom entrypoint).
+      # NOTE: Compose will interpolate ${NEO4J_PASS} from your project .env at deploy time.
+      NEO4J_AUTH: "${NEO4J_USER:-neo4j}/${NEO4J_PASS}"
+    ports: ["7474:7474", "7687:7687"]
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          /var/lib/neo4j/bin/cypher-shell -a bolt://localhost:7687
+          -u "$$(echo $$NEO4J_AUTH | cut -d/ -f1)"
+          -p "$$(echo $$NEO4J_AUTH | cut -d/ -f2-)"
+          'RETURN 1' || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command:
+      [
+        "redis-server",
+        "--save", "",
+        "--appendonly", "no",
+        "--maxmemory", "512mb",
+        "--maxmemory-policy", "allkeys-lru"
+      ]
+    expose:
+      - "6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  graph-init:
+    image: neo4j:5
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - |-
+        set -e
+        echo "[graph-init] Applying Neo4j constraints + seed nodes..."
+        if [ -z "$${NEO4J_PASS:-}" ]; then
+          echo "[graph-init] ERROR: NEO4J_PASS is not set (expected via env_file: .env)"
+          exit 1
+        fi
+        cat <<'CYPHER' | /var/lib/neo4j/bin/cypher-shell -a bolt://neo4j:7687 -u "$${NEO4J_USER:-neo4j}" -p "$${NEO4J_PASS}"
+        CREATE CONSTRAINT user_id_unique     IF NOT EXISTS FOR (u:User)    REQUIRE u.id IS UNIQUE;
+        CREATE CONSTRAINT project_id_unique  IF NOT EXISTS FOR (p:Project) REQUIRE p.id IS UNIQUE;
+        CREATE CONSTRAINT thread_id_unique   IF NOT EXISTS FOR (t:Thread)  REQUIRE t.id IS UNIQUE;
+        CREATE CONSTRAINT message_id_unique  IF NOT EXISTS FOR (m:Message) REQUIRE m.id IS UNIQUE;
+        CREATE INDEX project_name_idx IF NOT EXISTS FOR (p:Project) ON (p.name);
+        CREATE INDEX person_name_idx  IF NOT EXISTS FOR (p:Person)  ON (p.name);
+        MERGE (me:User {id:'me'}) ON CREATE SET me.name = 'Resonant Jones';
+        MERGE (p:Project {id:'proj-loose-threads'}) ON CREATE SET p.name = 'Loose Threads', p.createdAt = datetime();
+        MERGE (me)-[:OWNS]->(p);
+        CYPHER
+        echo "[graph-init] Done."
+  migrator:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    entrypoint: ["python"]
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      PYTHONPATH: /app
+      ALEMBIC_CONFIG: /app/backend/alembic.ini
+      ENABLE_BLIP_MODEL: "false"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-local}"
+      # --- Required security boundary ---
+      # Guardian API key MUST be explicitly set via .env for any non-test runtime.
+      # Fail fast if missing instead of silently defaulting.
+      GUARDIAN_API_KEY: "${GUARDIAN_API_KEY:?GUARDIAN_API_KEY must be set in .env}"
+      LLM_PROVIDER: "local"
+      EMBED_PROVIDER: "local"
+      EMBEDDER_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      EMBEDDING_BACKEND: "local"
+      CODEXIFY_USE_OPENAI: "0"
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./guardian/db/migrations:/app/guardian/db/migrations
+      - ./backend:/app/backend
+    restart: "no"
+    command: ["/app/backend/scripts/docker/run_migrator.py"]
+
+  obsidian-ingest:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    profiles:
+      - cli
+    entrypoint: ["python"]
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      PYTHONPATH: /app
+      # Embedder runtime
+      EMBED_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      # Vector store (used by the ingest indexer to write results)
+      CODEXIFY_VECTOR_STORE: "${CODEXIFY_VECTOR_STORE:-chroma}"
+      CODEXIFY_CHROMA_PATH: "${CODEXIFY_CHROMA_PATH:-./.chroma}"
+      CODEXIFY_COLLECTION: "${CODEXIFY_COLLECTION:-codexify_vault_supported}"
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+      - ./.chroma:/app/.chroma
+      # Mount the Obsidian vault from the host (read-only)
+      - ${OBSIDIAN_DIR:-}/:/vault:ro
+    restart: "no"
+    command: ["-m", "guardian.cli.ingest_cli", "ingest-obsidian", "/vault", "--rebuild"]
+
+  chatgpt-migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    profiles:
+      - cli
+    entrypoint: ["python", "scripts/chatgpt_import/import_chatgpt.py"]
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      LLM_PROVIDER: "local"
+      EMBED_PROVIDER: "local"
+      EMBEDDER_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      EMBEDDING_BACKEND: "local"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      # Ensure seed/init code can construct an OpenAI client even when running local-first
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-local}"
+      CODEXIFY_USE_OPENAI: "0"
+      CHATGPT_EXPORT_FILE: "/data/conversations.json"
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - ./scripts:/app/scripts
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+      # Mount local data directory for ChatGPT exports (kept out of git)
+      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    restart: "no"
+
+  model-prep:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    image: codexify-backend
+    working_dir: /app
+    entrypoint: ["python"]
+    volumes:
+      - ./guardian:/app/guardian
+      - ./models:/models
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      EMBED_MODEL_ID: "${EMBED_MODEL_ID:-BAAI/bge-large-en-v1.5}"
+      EMBED_MODEL_REVISION: "${EMBED_MODEL_REVISION:-}"
+      HF_TOKEN: "${HF_TOKEN:-}"
+    restart: "no"
+    command: ["/app/guardian/scripts/ensure_embed_model.py"]
+
+  # Backend owns supervised Codex/Claude Code execution on the server runtime.
+  # Persist CLI home so interactive login survives container restarts and both
+  # backend + worker-chat can reuse the same local credential state.
+  # Persist media/artifact storage on the host so uploaded/generated files do
+  # not disappear on image rebuilds or container replacement. The storage code
+  # is pinned to the same canonical path via STORAGE_BASE_PATH=/app/data/media.
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    entrypoint: ["python"]
+    ports: ["8888:8888"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/ping', timeout=2).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - ./config:/app/config:ro
+      - ./plugins:/app/plugins:ro
+      - ./tests:/app/tests:ro
+      - ./pytest.ini:/app/pytest.ini:ro
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+      - ./.chroma:/app/.chroma
+      - ./data/media:/app/data/media
+      - ./docker:/app/docker
+      - codexify_cli_home:/home/codexify
+      - hf_cache:/root/.cache/huggingface
+      - ./models:/models
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      PORT: "8888"
+      HOME: /home/codexify
+      CODEXIFY_CODEX_BIN: "${CODEXIFY_CODEX_BIN:-codex}"
+      CODEXIFY_CLAUDE_BIN: "${CODEXIFY_CLAUDE_BIN:-claude}"
+      # Command bus loopback: required so command execution re-enters the API via HTTP with full authz/middleware.
+      GUARDIAN_COMMAND_BUS_LOOPBACK_BASE: "http://backend:8888"
+      # Policy chokepoint mode for tool/command execution.
+      # Values: enforce | warn | off
+      CODEXIFY_POLICY_MODE: "${CODEXIFY_POLICY_MODE:-enforce}"
+      # Resolve core/legacy env drift when both LLM_PROVIDER and AI_BACKEND are present.
+      # Local smoke tests should start from the canonical core settings path so
+      # the backend does not inherit the legacy Groq default unless it is
+      # explicitly requested.
+      CODEXIFY_CONFIG_SOURCE: "${CODEXIFY_CONFIG_SOURCE:-core}"
+      CODEXIFY_SUPPORTED_PROFILE: "${CODEXIFY_SUPPORTED_PROFILE}"
+      # Single-user dev default (used when identity fallback is enabled).
+      CODEXIFY_SINGLE_USER_ID: "${CODEXIFY_SINGLE_USER_ID:-local}"
+      STORAGE_BASE_PATH: /app/data/media
+      NEO4J_BOLT_URL: bolt://neo4j:7687
+      ENABLE_CONNECTOR_WORKER: "false"
+      REDIS_URL: redis://redis:6379/0
+      # --- Graph-write runtime boundary (default-off) ---
+      # Neo4j container presence does NOT imply graph-write enablement.
+      # Both flags must be explicitly set to enable graph persistence.
+      CODEXIFY_ENABLE_GRAPH_WRITES: "${CODEXIFY_ENABLE_GRAPH_WRITES:-false}"
+      CODEXIFY_GRAPH_BACKEND: "${CODEXIFY_GRAPH_BACKEND:-noop}"
+      # Supported provider ids (backend): "local", "groq", "openai", "minimax"
+      LLM_PROVIDER: "${LLM_PROVIDER:-local}"
+      EMBED_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      CODEXIFY_VECTOR_STORE: "${CODEXIFY_VECTOR_STORE:-chroma}"
+      CODEXIFY_CHROMA_PATH: "${CODEXIFY_CHROMA_PATH:-./.chroma}"
+      CODEXIFY_COLLECTION: "${CODEXIFY_COLLECTION:-codexify_vault_supported}"
+      # ---  Ollama (OpenAI-compatible API) ---
+      # This is your local-first provider. From Codexify's POV it's just an API endpoint.
+      # NOTE: Keep this set to a model that actually exists on VaultNode (check /api/tags or /v1/models).
+      LOCAL_BASE_URL: "http://host.docker.internal:11434/v1"
+      CODEXIFY_LOCAL_VOICE_BASE_URL: "${CODEXIFY_LOCAL_VOICE_BASE_URL:-http://host.docker.internal:11434}"
+      LOCAL_API_KEY: "local"   # Ollama ignores; satisfies SDKs
+      LOCAL_CHAT_MODEL: "${LOCAL_CHAT_MODEL}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      LOCAL_EMBEDDINGS_REQUIRED: "${LOCAL_EMBEDDINGS_REQUIRED:-0}"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      CODEXIFY_VOICE_ROUTES_ENABLED: "${CODEXIFY_VOICE_ROUTES_ENABLED:-true}"
+      CODEXIFY_VOICE_TURNS_ENABLED: "${CODEXIFY_VOICE_TURNS_ENABLED:-false}"
+      CODEXIFY_TTS_PROVIDER: "${CODEXIFY_TTS_PROVIDER:-local_openai_compatible}"
+      CODEXIFY_STT_PROVIDER: "${CODEXIFY_STT_PROVIDER:-local_openai_compatible}"
+      CODEXIFY_DEFAULT_VOICE: "${CODEXIFY_DEFAULT_VOICE:-alloy}"
+
+      # --- OpenAI (cloud) ---
+      # NOTE: We intentionally do NOT override OPENAI_BASE_URL here.
+      # Default to a harmless placeholder so the OpenAI SDK can initialize in local mode
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-5.1}"
+      OPENAI_EMBED_MODEL: "${OPENAI_EMBED_MODEL:-text-embedding-3-small}"
+
+      # --- Anthropic (cloud) ---
+      # Set ANTHROPIC_API_KEY in your .env when you want to use Anthropic.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      ANTHROPIC_CHAT_MODEL: "${ANTHROPIC_CHAT_MODEL:-claude-4-5-sonnet-latest}"
+
+      # --- Gemini (cloud) ---
+      # Set GEMINI_API_KEY in your .env when you want to use Gemini.
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GEMINI_CHAT_MODEL: "${GEMINI_CHAT_MODEL:-gemini-1.5-flash}"
+    # TTS is an optional plugin surface, not a core boot dependency.
+    # Do not block backend startup on TTS health; voice routes must degrade independently.
+    depends_on:
+      db:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+      model-prep:
+        condition: service_completed_successfully
+      graph-init:
+        condition: service_completed_successfully
+    command:
+      - -c
+      - |
+        import os
+        import pathlib
+        import runpy
+        import sys
+
+        required = os.getenv("LOCAL_EMBEDDINGS_REQUIRED", "0").strip().lower() in {"1", "true", "yes", "on"}
+        model_dir = pathlib.Path(os.getenv("LOCAL_EMBED_MODEL", "/models/bge-large-en-v1.5"))
+
+        if required and not model_dir.exists():
+          print(
+              f"[backend] ERROR: LOCAL_EMBEDDINGS_REQUIRED=1 but model directory is missing: {model_dir}",
+              file=sys.stderr,
+          )
+          print(
+              "[backend] Run `docker compose run --rm model-prep` or mount a pre-provisioned model.",
+              file=sys.stderr,
+          )
+          raise SystemExit(1)
+
+        runpy.run_path("/app/backend/scripts/docker/run_backend.py", run_name="__main__")
+
+  worker-warmup:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    entrypoint: ["python"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      model-prep:
+        condition: service_completed_successfully
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      HOME: /home/codexify
+      CODEXIFY_CODEX_BIN: "${CODEXIFY_CODEX_BIN:-codex}"
+      CODEXIFY_CLAUDE_BIN: "${CODEXIFY_CLAUDE_BIN:-claude}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-local}"
+      EMBED_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      # Command bus loopback base (Docker): never use localhost for cross-container calls.
+      GUARDIAN_COMMAND_BUS_LOOPBACK_BASE: "http://backend:8888"
+      CODEXIFY_POLICY_MODE: "${CODEXIFY_POLICY_MODE:-enforce}"
+      # Never use localhost for cross-container calls; localhost points to this worker container.
+      # VaultNode is the host running Ollama. Keep this as a pure host:port (no /v1) unless you are explicitly targeting an OpenAI-compat gateway.
+      VAULTNODE_BASE_URL: "${VAULTNODE_BASE_URL:-http://host.docker.internal:11434}"
+      VAULTNODE_HEALTH_ENDPOINTS: "/healthz,/ping,/health,/api/tags"
+
+      # Local inference base URL (Ollama native by default). If you point this at an OpenAI-compat gateway, use a /v1 suffix.
+      LOCAL_BASE_URL: "http://host.docker.internal:11434/v1"
+      LOCAL_API_KEY: "local"   # Ollama ignores; satisfies SDKs
+      LOCAL_CHAT_MODEL: "${LOCAL_CHAT_MODEL}"
+
+      # Routing knobs (handled by guardian/core/ai_router.py)
+      # Prefer /v1/chat/completions first only when explicitly enabled.
+      LOCAL_COMPAT_FIRST: "${LOCAL_COMPAT_FIRST:-0}"
+      LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK: "${LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK:-0}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      REDIS_URL: redis://redis:6379/0
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      NEO4J_BOLT_URL: bolt://neo4j:7687
+      # --- Graph-write runtime boundary (default-off) ---
+      CODEXIFY_ENABLE_GRAPH_WRITES: "${CODEXIFY_ENABLE_GRAPH_WRITES:-false}"
+      CODEXIFY_GRAPH_BACKEND: "${CODEXIFY_GRAPH_BACKEND:-noop}"
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - ./docker:/app/docker
+      - codexify_cli_home:/home/codexify
+      - hf_cache:/root/.cache/huggingface
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+      - ./models:/models
+    restart: unless-stopped
+    command: ["-m", "guardian.workers.warmup_worker"]
+
+  worker-chat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    entrypoint: ["python"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      model-prep:
+        condition: service_completed_successfully
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      HOME: /home/codexify
+      CODEXIFY_CODEX_BIN: "${CODEXIFY_CODEX_BIN:-codex}"
+      CODEXIFY_CLAUDE_BIN: "${CODEXIFY_CLAUDE_BIN:-claude}"
+      LLM_PROVIDER: "local"
+      EMBED_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      # Command bus loopback base (Docker): never use localhost for cross-container calls.
+      GUARDIAN_COMMAND_BUS_LOOPBACK_BASE: "http://backend:8888"
+      CODEXIFY_POLICY_MODE: "${CODEXIFY_POLICY_MODE:-enforce}"
+      # Never use localhost for cross-container calls; localhost points to this worker container.
+      VAULTNODE_BASE_URL: "${VAULTNODE_BASE_URL:-http://host.docker.internal:11434}"
+      VAULTNODE_HEALTH_ENDPOINTS: "/healthz,/ping,/health,/api/tags"
+      LOCAL_BASE_URL: "http://host.docker.internal:11434/v1"
+      LOCAL_API_KEY: "local"
+      LOCAL_CHAT_MODEL: "${LOCAL_CHAT_MODEL}"
+      LOCAL_COMPAT_FIRST: "${LOCAL_COMPAT_FIRST:-0}"
+      LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK: "${LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK:-0}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      CODEXIFY_ASSISTANT_MESSAGE_AUDIO_AUTOGENERATE: "false"
+      REDIS_URL: redis://redis:6379/0
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      NEO4J_BOLT_URL: bolt://neo4j:7687
+      # --- Graph-write runtime boundary (default-off) ---
+      CODEXIFY_ENABLE_GRAPH_WRITES: "${CODEXIFY_ENABLE_GRAPH_WRITES:-false}"
+      CODEXIFY_GRAPH_BACKEND: "${CODEXIFY_GRAPH_BACKEND:-noop}"
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - ./plugins:/app/plugins:ro
+      - codexify_cli_home:/home/codexify
+      - hf_cache:/root/.cache/huggingface
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+      - ./models:/models
+    restart: unless-stopped
+    command: ["-m", "guardian.workers.chat_worker"]
+
+  worker-coding:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    entrypoint: ["python"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      HOME: /home/codexify
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+      GUARDIAN_DB_URL: postgresql://${POSTGRES_USER:-codexify}:${POSTGRES_PASSWORD:-codexify}@db:5432/${POSTGRES_DB:-Codexify}
+      NEO4J_BOLT_URL: bolt://neo4j:7687
+      CODEXIFY_SINGLE_USER_ID: "${CODEXIFY_SINGLE_USER_ID:-local}"
+      CODEX_ADAPTER_COMMAND: >-
+        codex exec --oss --local-provider ollama -m qwen3-coder:30b
+        --output-schema /app/backend/scripts/docker/codex-run-envelope.schema.json
+      # --- Graph-write runtime boundary (default-off) ---
+      CODEXIFY_ENABLE_GRAPH_WRITES: "${CODEXIFY_ENABLE_GRAPH_WRITES:-false}"
+      CODEXIFY_GRAPH_BACKEND: "${CODEXIFY_GRAPH_BACKEND:-noop}"
+    volumes:
+      - ./.git:/app/.git
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - ./codex_runner:/app/codex_runner
+      - codexify_cli_home:/home/codexify
+      - hf_cache:/root/.cache/huggingface
+    restart: unless-stopped
+    command: ["/app/backend/scripts/docker/run_worker_coding.py"]
+
+  worker-voice:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    entrypoint: ["python"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      LLM_PROVIDER: "local"
+      EMBED_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      GUARDIAN_COMMAND_BUS_LOOPBACK_BASE: "http://backend:8888"
+      CODEXIFY_POLICY_MODE: "${CODEXIFY_POLICY_MODE:-enforce}"
+      LOCAL_BASE_URL: "http://host.docker.internal:11434/v1"
+      CODEXIFY_LOCAL_VOICE_BASE_URL: "${CODEXIFY_LOCAL_VOICE_BASE_URL:-http://host.docker.internal:11434}"
+      LOCAL_API_KEY: "local"
+      LOCAL_CHAT_MODEL: "${LOCAL_CHAT_MODEL}"
+      LOCAL_COMPAT_FIRST: "${LOCAL_COMPAT_FIRST:-0}"
+      LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK: "${LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK:-0}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      CODEXIFY_VOICE_ROUTES_ENABLED: "${CODEXIFY_VOICE_ROUTES_ENABLED:-true}"
+      CODEXIFY_VOICE_TURNS_ENABLED: "${CODEXIFY_VOICE_TURNS_ENABLED:-false}"
+      CODEXIFY_TTS_PROVIDER: "${CODEXIFY_TTS_PROVIDER:-local_openai_compatible}"
+      CODEXIFY_STT_PROVIDER: "${CODEXIFY_STT_PROVIDER:-local_openai_compatible}"
+      CODEXIFY_DEFAULT_VOICE: "${CODEXIFY_DEFAULT_VOICE:-alloy}"
+      STORAGE_BASE_PATH: /app/data/media
+      REDIS_URL: redis://redis:6379/0
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      NEO4J_BOLT_URL: bolt://neo4j:7687
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - ./data/media:/app/data/media
+      - hf_cache:/root/.cache/huggingface
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+    restart: unless-stopped
+    command: ["-m", "guardian.workers.voice_worker"]
+
+  worker-document-embed:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    entrypoint: ["python"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      model-prep:
+        condition: service_completed_successfully
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      LLM_PROVIDER: "local"
+      EMBED_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      # Command bus loopback base (Docker): never use localhost for cross-container calls.
+      GUARDIAN_COMMAND_BUS_LOOPBACK_BASE: "http://backend:8888"
+      CODEXIFY_POLICY_MODE: "${CODEXIFY_POLICY_MODE:-enforce}"
+      # Never use localhost for cross-container calls; localhost points to this worker container.
+      VAULTNODE_BASE_URL: "${VAULTNODE_BASE_URL:-http://host.docker.internal:11434}"
+      VAULTNODE_HEALTH_ENDPOINTS: "/healthz,/ping,/health,/api/tags"
+      LOCAL_BASE_URL: "http://host.docker.internal:11434/v1"
+      LOCAL_API_KEY: "local"
+      LOCAL_CHAT_MODEL: "${LOCAL_CHAT_MODEL}"
+      LOCAL_COMPAT_FIRST: "${LOCAL_COMPAT_FIRST:-0}"
+      LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK: "${LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK:-0}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      REDIS_URL: redis://redis:6379/0
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      CODEXIFY_VECTOR_STORE: "${CODEXIFY_VECTOR_STORE:-chroma}"
+      CODEXIFY_CHROMA_PATH: "${CODEXIFY_CHROMA_PATH:-./.chroma}"
+      CODEXIFY_COLLECTION: "${CODEXIFY_COLLECTION:-codexify_vault_supported}"
+      NEO4J_BOLT_URL: bolt://neo4j:7687
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - hf_cache:/root/.cache/huggingface
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+      - ./models:/models
+      - ./.chroma:/app/.chroma
+    restart: unless-stopped
+    command: ["-m", "guardian.workers.document_embed_worker"]
+
+  worker-chat-embed:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    entrypoint: ["python"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      model-prep:
+        condition: service_completed_successfully
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      LLM_PROVIDER: "local"
+      EMBED_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      # Command bus loopback base (Docker): never use localhost for cross-container calls.
+      GUARDIAN_COMMAND_BUS_LOOPBACK_BASE: "http://backend:8888"
+      CODEXIFY_POLICY_MODE: "${CODEXIFY_POLICY_MODE:-enforce}"
+      # Never use localhost for cross-container calls; localhost points to this worker container.
+      VAULTNODE_BASE_URL: "${VAULTNODE_BASE_URL:-http://host.docker.internal:11434}"
+      VAULTNODE_HEALTH_ENDPOINTS: "/healthz,/ping,/health,/api/tags"
+      LOCAL_BASE_URL: "http://host.docker.internal:11434/v1"
+      LOCAL_API_KEY: "local"
+      LOCAL_CHAT_MODEL: "${LOCAL_CHAT_MODEL}"
+      LOCAL_COMPAT_FIRST: "${LOCAL_COMPAT_FIRST:-0}"
+      LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK: "${LOCAL_ENABLE_OLLAMA_GENERATE_FALLBACK:-0}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      REDIS_URL: redis://redis:6379/0
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      CODEXIFY_VECTOR_STORE: "${CODEXIFY_VECTOR_STORE:-chroma}"
+      CODEXIFY_CHROMA_PATH: "${CODEXIFY_CHROMA_PATH:-./.chroma}"
+      CODEXIFY_COLLECTION: "${CODEXIFY_COLLECTION:-codexify_vault_supported}"
+      NEO4J_BOLT_URL: bolt://neo4j:7687
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - hf_cache:/root/.cache/huggingface
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+      - ./models:/models
+      - ./.chroma:/app/.chroma
+    restart: unless-stopped
+    command: ["-m", "guardian.workers.chat_embedding_worker"]
+
+  embedding-backfill:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    profiles:
+      - backfill
+    entrypoint: ["python"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+      model-prep:
+        condition: service_completed_successfully
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      LLM_PROVIDER: "local"
+      EMBED_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      # Command bus loopback base (Docker): never use localhost for cross-container calls.
+      GUARDIAN_COMMAND_BUS_LOOPBACK_BASE: "http://backend:8888"
+      CODEXIFY_POLICY_MODE: "${CODEXIFY_POLICY_MODE:-enforce}"
+      LOCAL_BASE_URL: "http://host.docker.internal:11434/v1"
+      LOCAL_API_KEY: "local"
+      LOCAL_CHAT_MODEL: "${LOCAL_CHAT_MODEL}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      REDIS_URL: redis://redis:6379/0
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      CODEXIFY_VECTOR_STORE: "${CODEXIFY_VECTOR_STORE:-chroma}"
+      CODEXIFY_CHROMA_PATH: "${CODEXIFY_CHROMA_PATH:-./.chroma}"
+      CODEXIFY_COLLECTION: "${CODEXIFY_COLLECTION:-codexify_vault_supported}"
+      NEO4J_BOLT_URL: bolt://neo4j:7687
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - hf_cache:/root/.cache/huggingface
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+      - ./models:/models
+      - ./.chroma:/app/.chroma
+    restart: "no"
+    command: ["-m", "guardian.workers.embedding_backfill_worker"]
+
+  graph-backfill:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    profiles:
+      - backfill
+    entrypoint: ["python"]
+    depends_on:
+      db:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      graph-init:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+      model-prep:
+        condition: service_completed_successfully
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    environment:
+      <<: *postgres_env
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      # Command bus loopback base (Docker): never use localhost for cross-container calls.
+      GUARDIAN_COMMAND_BUS_LOOPBACK_BASE: "http://backend:8888"
+      CODEXIFY_POLICY_MODE: "${CODEXIFY_POLICY_MODE:-enforce}"
+      NEO4J_BOLT_URL: bolt://neo4j:7687
+      EMBED_PROVIDER: "local"
+      CODEXIFY_EMBEDDINGS_BACKEND: "${CODEXIFY_EMBEDDINGS_BACKEND:-local}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK: "${CODEXIFY_ALLOW_EMBEDDINGS_FALLBACK:-0}"
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SENTENCE_TRANSFORMERS_HOME: /models
+      # --- Graph-write runtime boundary (default-off) ---
+      CODEXIFY_ENABLE_GRAPH_WRITES: "${CODEXIFY_ENABLE_GRAPH_WRITES:-false}"
+      CODEXIFY_GRAPH_BACKEND: "${CODEXIFY_GRAPH_BACKEND:-noop}"
+    volumes:
+      - ./guardian:/app/codexify
+      - ./guardian:/app/guardian
+      - ./backend:/app/backend
+      - hf_cache:/root/.cache/huggingface
+      - ./models/bge-large-en-v1.5:/models/bge-large-en-v1.5:ro
+      - ./models:/models
+    restart: "no"
+    command: ["-m", "guardian.workers.graph_backfill_worker"]
+
+  hf-prefetch:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    profiles:
+      - cli
+    entrypoint: ["python"]
+    environment:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "0"
+      TRANSFORMERS_OFFLINE: "0"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      # Comma-separated repo ids
+      HF_PREFETCH_MODELS: "${HF_PREFETCH_MODELS:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice,Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign,Qwen/Qwen3-TTS-12Hz-1.7B-Base,Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice,Qwen/Qwen3-TTS-12Hz-0.6B-Base,Qwen/Qwen3-TTS-Tokenizer-12Hz}"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - ./backend:/app/backend
+    restart: "no"
+    command: ["/app/backend/scripts/docker/run_hf_prefetch.py"]
+
+  embed-prefetch:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: runtime
+    working_dir: /app
+    profiles:
+      - cli
+    entrypoint: ["python"]
+    environment:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "0"
+      TRANSFORMERS_OFFLINE: "0"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      LOCAL_EMBED_MODEL: "/models/bge-large-en-v1.5"
+      EMBED_MODEL_ID: "${EMBED_MODEL_ID:-BAAI/bge-large-en-v1.5}"
+      EMBED_MODEL_REVISION: "${EMBED_MODEL_REVISION:-}"
+    volumes:
+      - ./guardian:/app/guardian
+      - ./models:/models
+      - hf_cache:/root/.cache/huggingface
+    restart: "no"
+    command: ["/app/guardian/scripts/ensure_embed_model.py"]
+
+  tts:
+    # Optional voice service: only start when explicitly requested via --profile voice.
+    profiles:
+      - voice
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: tts-runtime
+    working_dir: /app
+    entrypoint: ["python"]
+    environment:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      PYTHONPATH: /app
+      HF_HOME: /root/.cache/huggingface
+      # Allow online downloads by default; set to 1 after running hf-prefetch for air-gapped use.
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
+      CODEXIFY_TTS_SERVICE_PROVIDER: "${CODEXIFY_TTS_SERVICE_PROVIDER:-qwen3_0.6b}"
+      CODEXIFY_TTS_PRELOAD_ON_STARTUP: "${CODEXIFY_TTS_PRELOAD_ON_STARTUP:-1}"
+    volumes:
+      - ./backend:/app/backend
+      - hf_cache:/root/.cache/huggingface
+    ports: ["8000:8000"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json
+          import urllib.request
+          with urllib.request.urlopen("http://localhost:8000/health", timeout=2) as response:
+              payload = json.load(response)
+          raise SystemExit(0 if payload.get("ready") else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 15s
+    restart: unless-stopped
+    command: ["/app/backend/scripts/docker/run_tts.py"]
+  frontend:
+    # NOTE: We run the dev UI using an official Node image so we always have /bin/sh.
+    # This avoids breakage if the local ./frontend Dockerfile was refactored into a distroless image.
+    image: node:20-alpine
+    pull_policy: always
+    working_dir: /app
+    ports: ["5173:5173"]
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/src/node_modules
+      - corepack_cache:/root/.cache/node/corepack
+      - frontend_pnpm_store:/pnpm/store
+    env_file: ${CODEXIFY_RUNTIME_ENV_FILE:-.env}
+    # Do not start the dev UI until the core API is actually reachable.
+    # This avoids proxy storms against the in-network hostname `backend` during boot.
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      VITE_PROXY_TARGET: http://backend:8888
+      # Dev-only: frontend receives API key for local development.
+      # DO NOT use this pattern for production deployments.
+      VITE_GUARDIAN_API_KEY: "${GUARDIAN_API_KEY:-}"
+      VITE_DEFAULT_LLM_PROVIDER: "local"
+      VITE_DEFAULT_EMBED_PROVIDER: "local"
+      PNPM_CONFIG_IGNORE_SCRIPTS: "true"
+      CI: "true"
+      CHOKIDAR_USEPOLLING: "true"
+      PNPM_HOME: /pnpm
+      PNPM_STORE_DIR: /pnpm/store
+    entrypoint: ["sh", "-lc"]
+    command:
+      - |
+        set -e
+        echo "[Frontend] Enabling pnpm via corepack..."
+        corepack enable
+        if [ ! -x /root/.cache/node/corepack/v1/pnpm/9.12.1/bin/pnpm.cjs ]; then
+          echo "[Frontend] Downloading pnpm@9.12.1 into persistent Corepack cache..."
+          corepack prepare pnpm@9.12.1 --activate
+        else
+          echo "[Frontend] Reusing cached pnpm@9.12.1 from Corepack cache..."
+          corepack prepare pnpm@9.12.1 --activate
+        fi
+
+        echo "[Frontend] Installing root deps..."
+        pnpm install --frozen-lockfile=false --ignore-scripts || pnpm install --ignore-scripts
+
+        echo "[Frontend] Installing src deps..."
+        pnpm --dir src install --frozen-lockfile=false --ignore-scripts || pnpm --dir src install --ignore-scripts
+
+        echo "[Frontend] Starting Vite dev server..."
+        cd /app/src
+        exec pnpm exec vite dev --host 0.0.0.0 --port 5173
+
+  e2e:
+    image: mcr.microsoft.com/playwright:v1.56.1-jammy
+    working_dir: /work
+    environment:
+      CI: "true"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      PNPM_HOME: /pnpm
+      PNPM_STORE_DIR: /work/.pnpm-store
+      PW_BASE_URL: http://frontend:5173
+    shm_size: "2gb"
+    volumes:
+      - ./:/work
+      - e2e_frontend_src_node_modules:/work/frontend/src/node_modules
+      - e2e_pnpm_store:/work/.pnpm-store
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        set -e
+        if ! command -v pnpm >/dev/null 2>&1; then
+          corepack enable
+          corepack prepare pnpm@9.12.1 --activate
+        fi
+        if [ ! -d /work/frontend/src/node_modules ] || [ -z "$(ls -A /work/frontend/src/node_modules 2>/dev/null)" ]; then
+          pnpm --dir /work/frontend/src install --no-lockfile
+        fi
+        exec "$0" "$@"
+
+volumes:
+  pg_data:
+  neo4j_data:
+  hf_cache:
+  codexify_models:
+    name: codexify_models
+  model_store:
+    driver: local
+  e2e_frontend_src_node_modules:
+  e2e_pnpm_store:
+  corepack_cache:
+  frontend_pnpm_store:
+  codexify_cli_home:

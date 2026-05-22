@@ -1,0 +1,1 @@
+{"error": "Collection expecting embedding with dimension of 3072, got 1024", "items_pending": 7580, "items_pending_source": "chroma_count", "items_processed": 0, "items_remaining": 7580, "last_exit_reason": "error", "last_run_at": "2026-01-07T07:56:54.268464+00:00", "total_messages": 7581, "updated_at": "2026-01-07T07:57:30.280378+00:00"}

@@ -1,0 +1,783 @@
+"""Document autosave and thread-document linkage API routes."""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any, Dict, List
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.orm import Session
+
+from guardian.core import event_bus
+from guardian.core.ai_router import chat_with_ai
+from guardian.core.db import GuardianDB
+from guardian.core.dependencies import (
+    RequestUserScope,
+    get_request_user_scope,
+    get_single_user_id,
+    require_api_key,
+)
+from guardian.db import models
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+_ALLOWED_DOC_FORMATS = {"markdown", "plain"}
+_FORMAT_STORAGE_MAP = {"markdown": "md", "plain": "txt"}
+_ALLOWED_LLM_PROVIDERS = {"local", "groq", "openai", "minimax"}
+
+
+class AutosaveRequest(BaseModel):
+    """Request body for autosave endpoint."""
+
+    thread_id: int
+    content: str
+
+
+class AutosaveResponse(BaseModel):
+    """Response for autosave endpoint."""
+
+    ok: bool
+    document_id: str
+    relation: str
+
+
+class ThreadDocumentResponse(BaseModel):
+    """Response for a single thread document."""
+
+    id: str
+    title: str
+    relation: str
+    created_at: str
+
+
+class DocumentGenerateRequest(BaseModel):
+    """Request body for document generation."""
+
+    thread_id: int | None = None
+    project_id: int | None = None
+    user_id: str | None = None
+    title: str | None = None
+    prompt: str
+    format: str | None = None
+    doc_type: str | None = Field(default=None, alias="type")
+    context: str | None = None
+    provider: str | None = None
+    model: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
+class DocumentGenerateResponse(BaseModel):
+    """Response body for document generation."""
+
+    ok: bool
+    document_id: str | None = None
+    content: str
+    format: str
+    title: str | None = None
+    provider: str | None = None
+    model: str | None = None
+
+
+class UploadedDocumentDetailResponse(BaseModel):
+    id: str
+    document_id: str
+    media_asset_id: str | None = None
+    project_id: int
+    thread_id: int | None = None
+    src_url: str
+    filename: str
+    filesize: int
+    mime_type: str
+    source_tag: str | None = None
+    parsed_text: str | None = None
+    embedding_status: str | None = None
+    embedding_error: str | None = None
+    embedding_started_at: str | None = None
+    embedding_completed_at: str | None = None
+    created_at: str
+
+
+# Module-level database instance (will be set by guardian_api.py)
+_db: GuardianDB | None = None
+
+
+def configure_db(db: GuardianDB) -> None:
+    """Configure the database instance for this router."""
+    global _db
+    _db = db
+
+
+def _get_db() -> GuardianDB:
+    """Get the configured database instance."""
+    if _db is None:
+        raise RuntimeError("Database not configured for documents router")
+    return _db
+
+
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
+def _request_account_id(request_user_scope: RequestUserScope) -> str:
+    account_id = str(request_user_scope.account_id or "").strip()
+    return account_id or get_single_user_id()
+
+
+def _resolve_document_owner_hint(
+    raw_user_id: str | None,
+    request_user_scope: RequestUserScope,
+    *,
+    fallback_user_id: str | None = None,
+) -> str:
+    requested_user_id = _normalize_optional_text(raw_user_id)
+    fallback = _normalize_optional_text(fallback_user_id)
+    account_id = _request_account_id(request_user_scope)
+
+    if request_user_scope.multi_user_enabled:
+        if requested_user_id and requested_user_id != account_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Requested user_id does not match the authenticated account"
+                ),
+            )
+        return account_id
+
+    return requested_user_id or fallback or get_single_user_id()
+
+
+def _validate_multi_user_owner_hint(
+    raw_user_id: str | None,
+    request_user_scope: RequestUserScope,
+) -> None:
+    if not request_user_scope.multi_user_enabled:
+        return
+
+    requested_user_id = _normalize_optional_text(raw_user_id)
+    account_id = _request_account_id(request_user_scope)
+    if requested_user_id and requested_user_id != account_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requested user_id does not match the authenticated account",
+        )
+
+
+def _require_thread_account_scope(
+    thread_id: int,
+    request_user_scope: RequestUserScope,
+    *,
+    thread: Any | None = None,
+) -> Any:
+    thread_record = thread
+    if thread_record is None:
+        return thread_record
+
+    if request_user_scope.multi_user_enabled:
+        account_id = _request_account_id(request_user_scope)
+        owner_id = str(getattr(thread_record, "user_id", "") or "").strip()
+        if owner_id != account_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Thread does not belong to the authenticated account",
+            )
+
+    return thread_record
+
+
+def _ensure_project_document_link(
+    session: Session,
+    *,
+    project_id: int | None,
+    document_id: str,
+    document_type: str,
+    attached_by: str | None = None,
+) -> None:
+    """Guarantee a project-document link exists (or is re-enabled)."""
+    if not project_id or not document_id:
+        return
+
+    normalized_type = str(document_type or "uploaded").strip().lower()
+    if normalized_type.startswith("gen"):
+        normalized_type = "generated"
+    else:
+        normalized_type = "uploaded"
+
+    existing = (
+        session.query(models.ProjectDocumentLink)
+        .filter_by(
+            project_id=project_id,
+            document_id=document_id,
+            document_type=normalized_type,
+        )
+        .first()
+    )
+    if existing:
+        if existing.is_enabled is False:
+            existing.is_enabled = True
+        if (
+            attached_by
+            and getattr(existing, "attached_by", None) != attached_by
+        ):
+            existing.attached_by = attached_by
+        return
+
+    session.add(
+        models.ProjectDocumentLink(
+            project_id=project_id,
+            document_id=document_id,
+            document_type=normalized_type,
+            attached_by=attached_by,
+        )
+    )
+
+
+def _resolve_uploaded_document_for_scope(
+    session: Session,
+    document_identity: str,
+    request_user_scope: RequestUserScope,
+):
+    identity = (document_identity or "").strip()
+    if not identity:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+    document = (
+        session.query(models.UploadedDocument)
+        .filter(
+            models.UploadedDocument.deleted_at.is_(None),
+            (
+                (models.UploadedDocument.id == identity)
+                | (models.UploadedDocument.asset_id == identity)
+            ),
+        )
+        .order_by(
+            (models.UploadedDocument.id == identity).desc(),
+            models.UploadedDocument.created_at.desc(),
+        )
+        .first()
+    )
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+    if request_user_scope.multi_user_enabled:
+        account_id = _request_account_id(request_user_scope)
+        owner_id = str(getattr(document, "user_id", "") or "").strip()
+        if owner_id != account_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Document does not belong to the authenticated account",
+            )
+    return document
+
+
+@router.post("/api/documents/autosave", response_model=AutosaveResponse)
+async def autosave_document(
+    request: AutosaveRequest,
+    _api_key: str = Depends(require_api_key),
+    request_user_scope: RequestUserScope = Depends(get_request_user_scope),
+) -> dict[str, Any]:
+    """
+    Autosave a session document linked to a thread.
+
+    If an autosave document already exists for the thread, it will be updated.
+    Otherwise, a new document is created and linked to the thread.
+
+    Args:
+        request: AutosaveRequest containing thread_id and content
+
+    Returns:
+        AutosaveResponse with document_id and relation type
+
+    Raises:
+        HTTPException: 400 if validation fails, 404 if thread not found, 500 on errors
+    """
+    # Validate inputs
+    if not request.thread_id:
+        logger.warning("Autosave request missing thread_id")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="thread_id is required",
+        )
+
+    if not request.content or not request.content.strip():
+        logger.warning("Autosave request missing or empty content")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="content is required and cannot be empty",
+        )
+
+    try:
+        db = _get_db()
+
+        with db.get_session() as session:
+            # Verify thread exists
+            thread = (
+                session.query(models.ChatThread)
+                .filter_by(id=request.thread_id)
+                .first()
+            )
+            if not thread:
+                logger.warning(
+                    f"Thread {request.thread_id} not found for autosave"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Thread {request.thread_id} not found",
+                )
+            _require_thread_account_scope(
+                request.thread_id, request_user_scope, thread=thread
+            )
+            owner_id = _resolve_document_owner_hint(
+                None,
+                request_user_scope,
+                fallback_user_id=getattr(thread, "user_id", None),
+            )
+
+            # Check if autosave document already exists for this thread
+            existing_link = (
+                session.query(models.ThreadDocument)
+                .filter_by(thread_id=request.thread_id, relation="autosave")
+                .first()
+            )
+
+            if existing_link:
+                # Update existing document
+                document = (
+                    session.query(models.GeneratedDocument)
+                    .filter_by(id=existing_link.document_id)
+                    .first()
+                )
+
+                if document:
+                    logger.info(
+                        f"Updating autosave document {document.id} for thread {request.thread_id}"
+                    )
+                    document.content = request.content
+                    document_id = document.id
+                else:
+                    # Link exists but document is missing - create new document
+                    logger.warning(
+                        f"Autosave link exists but document missing, creating new one"
+                    )
+                    document_id = str(uuid.uuid4())
+                    new_document = models.GeneratedDocument(
+                        id=document_id,
+                        project_id=thread.project_id,
+                        thread_id=request.thread_id,
+                        user_id=owner_id,
+                        title=f"Session notes - {thread.title}",
+                        content=request.content,
+                        format="md",
+                        model="autosave",
+                    )
+                    session.add(new_document)
+
+                    # Update the link to point to new document
+                    existing_link.document_id = document_id
+            else:
+                # Create new document
+                document_id = str(uuid.uuid4())
+                logger.info(
+                    f"Creating new autosave document {document_id} for thread {request.thread_id}"
+                )
+
+                new_document = models.GeneratedDocument(
+                    id=document_id,
+                    project_id=thread.project_id,
+                    thread_id=request.thread_id,
+                    user_id=owner_id,
+                    title=f"Session notes - {thread.title}",
+                    content=request.content,
+                    format="md",
+                    model="autosave",
+                )
+                session.add(new_document)
+
+                # Create thread-document link
+                link = models.ThreadDocument(
+                    thread_id=request.thread_id,
+                    document_id=document_id,
+                    relation="autosave",
+                )
+                session.add(link)
+
+            _ensure_project_document_link(
+                session,
+                project_id=getattr(thread, "project_id", None),
+                document_id=document_id,
+                document_type="generated",
+                attached_by=owner_id,
+            )
+            session.commit()
+
+        # Emit event (don't let event failures break the response)
+        try:
+            event_bus.emit_event(
+                topic="document.autosave",
+                payload={
+                    "thread_id": request.thread_id,
+                    "document_id": document_id,
+                },
+            )
+        except Exception as e:
+            logger.error(f"Failed to emit autosave event: {e}")
+
+        return {"ok": True, "document_id": document_id, "relation": "autosave"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in autosave_document: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to autosave document: {str(e)}",
+        )
+
+
+@router.post("/api/documents/generate", response_model=DocumentGenerateResponse)
+async def generate_document(
+    request: DocumentGenerateRequest,
+    _api_key: str = Depends(require_api_key),
+    request_user_scope: RequestUserScope = Depends(get_request_user_scope),
+) -> dict[str, Any]:
+    """Generate a document draft using the configured LLM backend."""
+    prompt = _normalize_optional_text(request.prompt)
+    if not prompt:
+        logger.warning("Document generation request missing prompt")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="prompt is required and cannot be empty",
+        )
+
+    if request.thread_id is None or request.thread_id <= 0:
+        logger.warning("Document generation request missing thread_id")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="thread_id is required",
+        )
+    _validate_multi_user_owner_hint(request.user_id, request_user_scope)
+
+    title = _normalize_optional_text(request.title)
+    context = _normalize_optional_text(request.context)
+
+    format_hint = _normalize_optional_text(request.format or request.doc_type)
+    format_hint = (format_hint or "markdown").lower()
+    if format_hint not in _ALLOWED_DOC_FORMATS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="format must be one of: markdown, plain",
+        )
+
+    provider = _normalize_optional_text(request.provider)
+    if provider:
+        provider = provider.lower()
+        if provider not in _ALLOWED_LLM_PROVIDERS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="provider must be one of: local, groq, openai, minimax",
+            )
+
+    model = _normalize_optional_text(request.model)
+    model_name = model or provider or "default"
+
+    system_content = "You are a document generation assistant. " + (
+        "Return markdown formatted content."
+        if format_hint == "markdown"
+        else "Return plain text without markdown formatting."
+    )
+    user_lines = []
+    if title:
+        user_lines.append(f"Title: {title}")
+    if context:
+        user_lines.append(f"Context: {context}")
+    user_lines.append(f"Prompt: {prompt}")
+    user_content = "\n".join(user_lines)
+
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+    try:
+        content = str(chat_with_ai(messages, model=model, provider=provider))
+    except HTTPException as exc:
+        logger.error("Document generation failed: %s", exc.detail)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document generation failed. Please try again later.",
+        ) from exc
+    except Exception as exc:
+        logger.error("Document generation failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document generation failed. Please try again later.",
+        ) from exc
+
+    document_id: str | None = None
+    try:
+        db = _get_db()
+        with db.get_session() as session:
+            thread = (
+                session.query(models.ChatThread)
+                .filter_by(id=request.thread_id)
+                .first()
+            )
+            if not thread:
+                logger.warning(
+                    "Thread %s not found for document generation",
+                    request.thread_id,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Thread {request.thread_id} not found",
+                )
+            _require_thread_account_scope(
+                request.thread_id, request_user_scope, thread=thread
+            )
+            owner_id = _resolve_document_owner_hint(
+                request.user_id,
+                request_user_scope,
+                fallback_user_id=getattr(thread, "user_id", None),
+            )
+
+            document_id = str(uuid.uuid4())
+            resolved_title = (
+                title
+                or _normalize_optional_text(getattr(thread, "title", None))
+                or "Generated document"
+            )
+            generated_document = models.GeneratedDocument(
+                id=document_id,
+                project_id=thread.project_id,
+                thread_id=thread.id,
+                user_id=owner_id,
+                title=resolved_title,
+                content=content,
+                format=_FORMAT_STORAGE_MAP[format_hint],
+                model=model_name,
+            )
+            session.add(generated_document)
+
+            link = models.ThreadDocument(
+                thread_id=thread.id,
+                document_id=document_id,
+                relation="attached",
+            )
+            session.add(link)
+            _ensure_project_document_link(
+                session,
+                project_id=getattr(thread, "project_id", None),
+                document_id=document_id,
+                document_type="generated",
+                attached_by=owner_id,
+            )
+            session.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Failed to persist generated document: %s", exc, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to persist generated document.",
+        ) from exc
+
+    return {
+        "ok": True,
+        "document_id": document_id,
+        "content": content,
+        "format": format_hint,
+        "title": title,
+        "provider": provider,
+        "model": model,
+    }
+
+
+async def _get_thread_documents_impl(
+    thread_id: int,
+    request_user_scope: RequestUserScope,
+    _db: GuardianDB | None = None,
+) -> dict[str, Any]:
+    """
+    Pure implementation of thread-document retrieval.
+
+    Accepts resolved dependencies so it can be tested directly without FastAPI
+    dependency injection.
+
+    Args:
+        thread_id: The thread ID to get documents for
+        request_user_scope: Pre-resolved RequestUserScope
+        _db: Optional database instance (uses _get_db() if not provided)
+
+    Returns:
+        Dict with 'ok' status and 'documents' array
+
+    Raises:
+        HTTPException: 404 if thread not found
+    """
+    try:
+        db = _db or _get_db()
+
+        with db.get_session() as session:
+            # Verify thread exists
+            thread = (
+                session.query(models.ChatThread).filter_by(id=thread_id).first()
+            )
+            if not thread:
+                logger.warning(f"Thread {thread_id} not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Thread {thread_id} not found",
+                )
+            _require_thread_account_scope(
+                thread_id, request_user_scope, thread=thread
+            )
+
+            # Get all thread-document links
+            links = (
+                session.query(models.ThreadDocument)
+                .filter_by(thread_id=thread_id)
+                .order_by(models.ThreadDocument.created_at.desc())
+                .all()
+            )
+
+            # Fetch document details
+            documents = []
+            for link in links:
+                # Try to find in GeneratedDocument first
+                doc = (
+                    session.query(models.GeneratedDocument)
+                    .filter_by(id=link.document_id)
+                    .first()
+                )
+
+                if doc:
+                    documents.append(
+                        {
+                            "id": doc.id,
+                            "title": doc.title,
+                            "relation": link.relation,
+                            "created_at": (
+                                link.created_at.isoformat()
+                                if link.created_at
+                                else None
+                            ),
+                        }
+                    )
+                    continue
+
+                uploaded_doc = (
+                    session.query(models.UploadedDocument)
+                    .filter_by(id=link.document_id)
+                    .first()
+                )
+                if uploaded_doc:
+                    documents.append(
+                        {
+                            "id": uploaded_doc.id,
+                            "title": uploaded_doc.filename or uploaded_doc.id,
+                            "relation": link.relation,
+                            "created_at": (
+                                link.created_at.isoformat()
+                                if link.created_at
+                                else None
+                            ),
+                        }
+                    )
+                    continue
+
+                # Document not found - log warning but continue
+                logger.warning(
+                    f"Document {link.document_id} linked to thread {thread_id} not found"
+                )
+
+            return {"ok": True, "documents": documents}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in _get_thread_documents_impl: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve thread documents: {str(e)}",
+        )
+
+
+@router.get("/api/threads/{thread_id}/documents")
+async def get_thread_documents(
+    thread_id: int,
+    _api_key: str = Depends(require_api_key),
+    request_user_scope: RequestUserScope = Depends(get_request_user_scope),
+) -> dict[str, Any]:
+    """
+    Get all documents linked to a thread.
+
+    Returns documents with their relation types (autosave, attached, reference).
+    Documents are ordered by creation date (newest first).
+
+    Args:
+        thread_id: The thread ID to get documents for
+
+    Returns:
+        Dict with 'ok' status and 'documents' array
+
+    Raises:
+        HTTPException: 404 if thread not found
+    """
+    return await _get_thread_documents_impl(thread_id, request_user_scope)
+
+
+@router.get(
+    "/api/documents/{document_id}",
+    response_model=UploadedDocumentDetailResponse,
+)
+async def get_uploaded_document_detail(
+    document_id: str,
+    _api_key: str = Depends(require_api_key),
+    request_user_scope: RequestUserScope = Depends(get_request_user_scope),
+) -> dict[str, Any]:
+    db = _get_db()
+    with db.get_session() as session:
+        document = _resolve_uploaded_document_for_scope(
+            session, document_id, request_user_scope
+        )
+        return {
+            "id": document.id,
+            "document_id": document.id,
+            "media_asset_id": document.asset_id,
+            "project_id": int(document.project_id or 0),
+            "thread_id": document.thread_id,
+            "src_url": document.src_url,
+            "filename": document.filename,
+            "filesize": document.filesize,
+            "mime_type": document.mime_type,
+            "source_tag": document.source_tag,
+            "parsed_text": document.parsed_text,
+            "embedding_status": document.embedding_status,
+            "embedding_error": document.embedding_error,
+            "embedding_started_at": (
+                document.embedding_started_at.isoformat()
+                if document.embedding_started_at
+                else None
+            ),
+            "embedding_completed_at": (
+                document.embedding_completed_at.isoformat()
+                if document.embedding_completed_at
+                else None
+            ),
+            "created_at": (
+                document.created_at.isoformat() if document.created_at else ""
+            ),
+        }

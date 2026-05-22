@@ -1,0 +1,386 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import api, { buildLlmCatalogPath } from "@/lib/api";
+import { logOnce } from "@/lib/logging/logOnce";
+import type { ComposerInferenceMode } from "@/types/inference";
+
+type CatalogReasoningRuntime = {
+  mode: ComposerInferenceMode | null;
+  instruction: string | null;
+  profileReason: string | null;
+};
+
+export type LlmCatalogModel = {
+  id: string;
+  canonicalId: string;
+  providerId: string;
+  displayName: string;
+  pickerLabel: string;
+  displayLabel: string;
+  alias?: string;
+  namespace?: string;
+  source?: string;
+  contextWindow?: number;
+  supportsChat?: boolean;
+  supportsVision?: boolean;
+  supportsTextInput?: boolean;
+  modelKind?: "chat" | "vision_chat" | "utility";
+  override?: {
+    displayLabel?: string | null;
+    pickerLabel?: string | null;
+    supportsChat?: boolean | null;
+    supportsVision?: boolean | null;
+    supportsTextInput?: boolean | null;
+    modelKind?: "chat" | "vision_chat" | "utility" | null;
+    notes?: string | null;
+    updatedAt?: string | null;
+  };
+  capabilities?: {
+    chat?: boolean;
+    vision?: boolean;
+    textInput?: boolean;
+    tools?: boolean;
+    streaming?: boolean;
+  };
+  runtime?: {
+    reasoning?: CatalogReasoningRuntime;
+  };
+};
+
+export type LlmCatalogProvider = {
+  id: string;
+  displayName: string;
+  enabled: boolean;
+  authorized: boolean;
+  available: boolean;
+  disabledReason?: string;
+  source?: {
+    kind?: string;
+    baseUrl?: string;
+    host?: string;
+    port?: number;
+    label?: string;
+  };
+  models: LlmCatalogModel[];
+};
+
+function normalizeString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeReasoningMode(value: unknown): ComposerInferenceMode | null {
+  const normalized = normalizeString(value);
+  if (normalized === "default" || normalized === "think" || normalized === "no_think") {
+    return normalized;
+  }
+  return null;
+}
+
+function normalizeBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function normalizeModelKind(value: unknown): "chat" | "vision_chat" | "utility" | undefined {
+  const normalized = normalizeString(value);
+  if (
+    normalized === "chat" ||
+    normalized === "vision_chat" ||
+    normalized === "utility"
+  ) {
+    return normalized;
+  }
+  return undefined;
+}
+
+export function isChatSelectableModel(model: {
+  supportsChat?: boolean;
+  modelKind?: "chat" | "vision_chat" | "utility";
+} | null | undefined): boolean {
+  if (!model) return false;
+  if (model.supportsChat === false) return false;
+  return model.modelKind !== "utility";
+}
+
+export function describeModelCapability(model: {
+  supportsVision?: boolean;
+  supportsChat?: boolean;
+  modelKind?: "chat" | "vision_chat" | "utility";
+} | null | undefined): string {
+  if (!model || model.supportsChat === false || model.modelKind === "utility") {
+    return "Utility model";
+  }
+  return model.supportsVision ? "Vision-capable chat" : "Text-only chat";
+}
+
+function normalizeModel(
+  providerId: string,
+  raw: unknown
+): LlmCatalogModel | null {
+  if (!raw || typeof raw !== "object") return null;
+  const model = raw as Record<string, unknown>;
+  const canonicalId =
+    normalizeString(model.canonical_id) ?? normalizeString(model.id);
+  if (!canonicalId) return null;
+
+  const displayLabel =
+    normalizeString(model.display_label) ??
+    normalizeString(model.displayName) ??
+    normalizeString(model.label) ??
+    canonicalId;
+  const pickerLabel =
+    normalizeString(model.picker_label) ??
+    normalizeString(model.pickerLabel) ??
+    displayLabel ??
+    canonicalId;
+  const alias = normalizeString(model.alias) ?? undefined;
+  const override =
+    model.override && typeof model.override === "object"
+      ? (model.override as Record<string, unknown>)
+      : null;
+  const displayName =
+    displayLabel ?? pickerLabel ?? alias ?? canonicalId;
+  const runtime = model.runtime;
+  const reasoning =
+    runtime && typeof runtime === "object"
+      ? (runtime as Record<string, unknown>).reasoning
+      : null;
+  const capabilities =
+    model.capabilities && typeof model.capabilities === "object"
+      ? (model.capabilities as Record<string, unknown>)
+      : null;
+  const supportsChat =
+    normalizeBoolean(model.supports_chat) ??
+    normalizeBoolean(model.supportsChat) ??
+    normalizeBoolean(capabilities?.chat) ??
+    (normalizeModelKind(model.model_kind ?? model.modelKind) !== "utility");
+  const supportsVision =
+    normalizeBoolean(model.supports_vision) ??
+    normalizeBoolean(model.supportsVision) ??
+    normalizeBoolean(capabilities?.vision) ??
+    false;
+  const supportsTextInput =
+    normalizeBoolean(model.supports_text_input) ??
+    normalizeBoolean(model.supportsTextInput) ??
+    normalizeBoolean(capabilities?.textInput) ??
+    normalizeBoolean(capabilities?.text_input) ??
+    supportsChat;
+  const modelKind =
+    normalizeModelKind(model.model_kind ?? model.modelKind) ??
+    (supportsChat ? (supportsVision ? "vision_chat" : "chat") : "utility");
+  const overrideModelKind = normalizeModelKind(
+    override?.modelKind ?? override?.model_kind
+  );
+
+  return {
+    id: canonicalId,
+    canonicalId,
+    providerId,
+    displayName,
+    pickerLabel,
+    displayLabel,
+    alias,
+    namespace: normalizeString(model.namespace) ?? undefined,
+    source: normalizeString(model.source) ?? undefined,
+    contextWindow:
+      typeof model.contextWindow === "number" && Number.isFinite(model.contextWindow)
+        ? model.contextWindow
+        : undefined,
+    supportsChat,
+    supportsVision,
+    supportsTextInput,
+    modelKind,
+    override:
+      override
+        ? {
+            displayLabel:
+              normalizeString(override.displayLabel ?? override.display_label) ??
+              null,
+            pickerLabel:
+              normalizeString(override.pickerLabel ?? override.picker_label) ??
+              null,
+            supportsChat:
+              normalizeBoolean(override.supportsChat ?? override.supports_chat) ??
+              null,
+            supportsVision:
+              normalizeBoolean(override.supportsVision ?? override.supports_vision) ??
+              null,
+            supportsTextInput:
+              normalizeBoolean(
+                override.supportsTextInput ?? override.supports_text_input
+              ) ?? null,
+            modelKind: overrideModelKind ?? null,
+            notes: normalizeString(override.notes) ?? null,
+            updatedAt:
+              normalizeString(override.updatedAt ?? override.updated_at) ?? null,
+          }
+        : undefined,
+    capabilities:
+      capabilities
+        ? {
+            chat: supportsChat,
+            vision: supportsVision,
+            textInput: supportsTextInput,
+            tools: Boolean(capabilities.tools),
+            streaming: Boolean(capabilities.streaming),
+          }
+        : undefined,
+    runtime:
+      reasoning && typeof reasoning === "object"
+        ? {
+            reasoning: {
+              mode: normalizeReasoningMode(
+                (reasoning as Record<string, unknown>).mode
+              ),
+              instruction: normalizeString(
+                (reasoning as Record<string, unknown>).instruction
+              ),
+              profileReason: normalizeString(
+                (reasoning as Record<string, unknown>).profile_reason
+              ),
+            },
+          }
+        : undefined,
+  };
+}
+
+function normalizeProvider(raw: unknown): LlmCatalogProvider | null {
+  if (!raw || typeof raw !== "object") return null;
+  const provider = raw as Record<string, unknown>;
+  const id = normalizeString(provider.id);
+  if (!id) return null;
+
+  const models = Array.isArray(provider.models)
+    ? provider.models
+        .map((entry) => normalizeModel(id, entry))
+        .filter(Boolean) as LlmCatalogModel[]
+    : [];
+
+  return {
+    id,
+    displayName: normalizeString(provider.displayName) ?? id,
+    enabled: Boolean(provider.enabled),
+    authorized: Boolean(provider.authorized),
+    available: Boolean(provider.available),
+    disabledReason: normalizeString(provider.disabled_reason) ?? undefined,
+    source:
+      provider.source && typeof provider.source === "object"
+        ? {
+            kind:
+              normalizeString((provider.source as Record<string, unknown>).kind) ??
+              undefined,
+            baseUrl:
+              normalizeString(
+                (provider.source as Record<string, unknown>).baseUrl
+              ) ?? undefined,
+            host:
+              normalizeString((provider.source as Record<string, unknown>).host) ??
+              undefined,
+            port:
+              typeof (provider.source as Record<string, unknown>).port === "number"
+                ? Number((provider.source as Record<string, unknown>).port)
+                : undefined,
+            label:
+              normalizeString((provider.source as Record<string, unknown>).label) ??
+              undefined,
+          }
+        : undefined,
+    models,
+  };
+}
+
+export function useLlmCatalog() {
+  const [providers, setProviders] = useState<LlmCatalogProvider[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const hasFetchedRef = useRef(false);
+
+  const loadCatalog = useCallback(
+    async (options: { silent?: boolean; throwOnError?: boolean } = {}) => {
+      if (!options.silent) {
+        setLoading(true);
+      }
+      setError(null);
+
+      const catalogPath = buildLlmCatalogPath();
+      try {
+        const response = await api.get<{ providers?: unknown[] }>(catalogPath);
+        const nextProviders = Array.isArray(response?.data?.providers)
+          ? response.data.providers
+              .map((entry) => normalizeProvider(entry))
+              .filter(Boolean) as LlmCatalogProvider[]
+          : [];
+        setProviders(nextProviders);
+      } catch (fetchError) {
+        logOnce("poll:guardian-llm-catalog", 10_000, () => {
+          console.warn(
+            `[guardian] failed to load catalog from ${catalogPath}`,
+            fetchError
+          );
+        });
+        setError("Model catalog unavailable");
+        if (options.throwOnError) {
+          throw fetchError;
+        }
+      } finally {
+        if (!options.silent) {
+          setLoading(false);
+        }
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (hasFetchedRef.current) return;
+    hasFetchedRef.current = true;
+    void loadCatalog();
+  }, [loadCatalog]);
+
+  const models = useMemo(
+    () => providers.flatMap((provider) => provider.models),
+    [providers]
+  );
+
+  const getProviderById = useCallback(
+    (providerId: string | null | undefined) => {
+      if (!providerId) return null;
+      return providers.find((provider) => provider.id === providerId) ?? null;
+    },
+    [providers]
+  );
+
+  const getModelById = useCallback(
+    (modelId: string | null | undefined) => {
+      if (!modelId) return null;
+      return models.find((model) => model.id === modelId) ?? null;
+    },
+    [models]
+  );
+
+  const findProviderForModel = useCallback(
+    (modelId: string | null | undefined) => {
+      if (!modelId) return null;
+      return (
+        providers.find((provider) =>
+          provider.models.some(
+            (model) => isChatSelectableModel(model) && model.id === modelId
+          )
+        ) ?? null
+      );
+    },
+    [providers]
+  );
+
+  return {
+    providers,
+    models,
+    loading,
+    error,
+    refresh: loadCatalog,
+    getProviderById,
+    getModelById,
+    findProviderForModel,
+  };
+}

@@ -1,0 +1,33 @@
+{
+  "name": "guardian-monorepo",
+  "private": true,
+  "scripts": {
+    "lint": "pnpm --dir frontend lint",
+    "build": "pnpm --dir frontend build",
+    "test": "pnpm --dir frontend test",
+    "format": "pnpm --dir frontend format",
+    "format:check": "pnpm --dir frontend format:check",
+    "process-logs": "npx tsx scripts/process_logs.ts",
+    "heartbeat": "python scripts/content/run_heartbeat_orchestrator.py",
+    "heartbeat:review": "python scripts/content/review_heartbeat_run.py",
+    "heartbeat:stage": "python scripts/content/stage_heartbeat_outbox.py",
+    "heartbeat:outbox": "python scripts/content/inspect_heartbeat_outbox.py",
+    "heartbeat:full": "make heartbeat-full"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.14",
+    "@tailwindcss/vite": "^4.1.14",
+    "@tauri-apps/cli": "^2.10.1",
+    "autoprefixer": "^10.4.21",
+    "baseline-browser-mapping": "^2.10.0",
+    "tailwindcss": "^4.1.14"
+  },
+  "dependencies": {
+    "dompurify": "^3.3.0",
+    "event-source-polyfill": "^1.0.31",
+    "monaco-editor": "^0.53.0",
+    "react-force-graph": "^1.48.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  }
+}
