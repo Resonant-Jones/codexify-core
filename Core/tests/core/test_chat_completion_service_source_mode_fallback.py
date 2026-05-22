@@ -1,0 +1,774 @@
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+from urllib.parse import quote
+
+import pytest
+
+from guardian.context.retrieval_router_policy import (
+    RETRIEVAL_OVERRIDE_CONVERSATION,
+    RETRIEVAL_OVERRIDE_NONE,
+    RETRIEVAL_OVERRIDE_PERSONAL_KNOWLEDGE,
+    RETRIEVAL_OVERRIDE_PROJECT,
+    SOURCE_MODE_CONVERSATION,
+    SOURCE_MODE_PERSONAL_KNOWLEDGE,
+    SOURCE_MODE_PROJECT,
+    SOURCE_MODE_WORKSPACE,
+    WIDEN_REASON_NONE,
+)
+from guardian.core import chat_completion_service
+from guardian.obsidian.indexer import OBSIDIAN_NAMESPACE
+from guardian.tasks.types import ChatCompletionTask, task_from_dict
+
+
+def _seed_completion_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    captured: dict[str, object] = {}
+    mock_chatlog_db = MagicMock()
+    mock_chatlog_db.get_chat_thread.return_value = {
+        "id": 1,
+        "user_id": "user-1",
+        "project_id": 42,
+    }
+    mock_chatlog_db.list_messages.return_value = [
+        {"id": 1, "role": "user", "content": "What changed?"}
+    ]
+
+    class _FakeBroker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def assemble(
+            self,
+            thread_id,
+            query,
+            depth_mode,
+            user_id,
+            project_id=None,
+            source_mode=SOURCE_MODE_PROJECT,
+            retrieval_policy=None,
+            **kwargs,
+        ):
+            captured["thread_id"] = thread_id
+            captured["query"] = query
+            captured["depth_mode"] = depth_mode
+            captured["user_id"] = user_id
+            captured["project_id"] = project_id
+            captured["source_mode"] = source_mode
+            return {"semantic": []}, {
+                "documents": [],
+                "graph": [],
+                "source_mode": source_mode,
+                "widen_reason": WIDEN_REASON_NONE,
+            }
+
+    settings = SimpleNamespace(
+        LLM_PROVIDER="local",
+        LOCAL_LLM_MODEL="local-model",
+        DEFAULT_LOCAL_MODEL="local-model",
+        LLM_MODEL="local-model",
+    )
+
+    monkeypatch.setattr(
+        chat_completion_service, "get_settings", lambda: settings
+    )
+    monkeypatch.setattr(
+        chat_completion_service,
+        "validate_llm_config",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        chat_completion_service,
+        "build_guardian_system_prompt",
+        lambda **kwargs: ("BASE SYSTEM", {}),
+    )
+    monkeypatch.setattr(
+        chat_completion_service,
+        "build_context_system_message_with_meta",
+        lambda *args, **kwargs: (None, {}),
+    )
+    monkeypatch.setattr(chat_completion_service, "ContextBroker", _FakeBroker)
+    monkeypatch.setattr(
+        chat_completion_service.dependencies,
+        "chatlog_db",
+        mock_chatlog_db,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        chat_completion_service.dependencies,
+        "CHAT_PROVIDER",
+        "local",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        chat_completion_service.dependencies,
+        "_vector_store",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        chat_completion_service.dependencies,
+        "_memory_store",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        chat_completion_service.dependencies,
+        "_sensors",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        chat_completion_service.dependencies,
+        "DEFAULT_MODEL",
+        "local-model",
+        raising=False,
+    )
+    return captured
+
+
+def _origin_with_source_mode_and_override(
+    *,
+    source_mode: str | None = None,
+    retrieval_override: dict[str, object] | str | None = None,
+) -> str:
+    segments = ["api:chat.complete", "turn_id=abc"]
+    if source_mode is not None:
+        segments.append(f"source_mode={source_mode}")
+    if retrieval_override is not None:
+        if isinstance(retrieval_override, str):
+            encoded_override = retrieval_override
+        else:
+            encoded_override = quote(
+                json.dumps(retrieval_override, separators=(",", ":"))
+            )
+        segments.append(f"retrieval_override={encoded_override}")
+    return "|".join(segments)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origin",
+    [
+        None,
+        "",
+        "api:chat.complete|turn_id=abc",
+        "api:chat.complete|turn_id=abc|source_mode=invalid",
+        "api:chat.complete|turn_id=abc|retrieval_override=not-json",
+        "malformed-origin-payload",
+    ],
+)
+async def test_build_messages_for_llm_defaults_to_project_for_missing_or_malformed_origin(
+    monkeypatch: pytest.MonkeyPatch, origin: str | None
+) -> None:
+    captured = _seed_completion_service(monkeypatch)
+
+    task = ChatCompletionTask(
+        user_id="local",
+        thread_id=1,
+        provider="local",
+        model=None,
+        origin=origin,
+    )
+    (
+        messages,
+        _provider,
+        _model,
+        _bundle,
+        trace,
+    ) = await chat_completion_service.build_messages_for_llm(task)
+
+    assert messages
+    assert captured["project_id"] == 42
+    assert captured["source_mode"] == SOURCE_MODE_PROJECT
+    assert trace["source_mode"] == SOURCE_MODE_PROJECT
+    assert trace["widen_reason"] == WIDEN_REASON_NONE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origin, retrieval_override, expected_source_mode",
+    [
+        (
+            "api:chat.complete|turn_id=abc|source_mode=project",
+            {"mode": "project"},
+            "project",
+        ),
+        (
+            "api:chat.complete|turn_id=abc|source_mode=project",
+            {"mode": "personal_knowledge"},
+            "personal_knowledge",
+        ),
+        (
+            "api:chat.complete|turn_id=abc|source_mode=personal_knowledge",
+            {"mode": "none"},
+            "personal_knowledge",
+        ),
+        (
+            "api:chat.complete|turn_id=abc|source_mode=personal_knowledge",
+            {"mode": "conversation"},
+            "conversation",
+        ),
+        (
+            "api:chat.complete|turn_id=abc|source_mode=project",
+            {"mode": "bogus"},
+            "project",
+        ),
+    ],
+)
+async def test_build_messages_for_llm_applies_explicit_retrieval_override_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    retrieval_override: dict[str, str],
+    expected_source_mode: str,
+) -> None:
+    captured = _seed_completion_service(monkeypatch)
+
+    task = ChatCompletionTask(
+        user_id="local",
+        thread_id=1,
+        provider="local",
+        model=None,
+        origin=origin,
+    )
+    task.slash_intent = "slash:search"
+    task.retrieval_override = retrieval_override
+
+    (
+        _messages,
+        _provider,
+        _model,
+        _bundle,
+        trace,
+    ) = await chat_completion_service.build_messages_for_llm(task)
+
+    assert captured["source_mode"] == expected_source_mode
+    assert trace["source_mode"] == expected_source_mode
+    assert trace["widen_reason"] == "none"
+    assert trace["slash_intent"] == "slash:search"
+    assert trace["retrieval_override"] == retrieval_override
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_source_mode",
+    [
+        SOURCE_MODE_PROJECT,
+        SOURCE_MODE_PERSONAL_KNOWLEDGE,
+        SOURCE_MODE_CONVERSATION,
+    ],
+)
+async def test_build_messages_for_llm_keeps_requested_source_mode_without_override(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_source_mode: str,
+) -> None:
+    captured = _seed_completion_service(monkeypatch)
+
+    task = ChatCompletionTask(
+        user_id="local",
+        thread_id=1,
+        provider="local",
+        model=None,
+        origin=_origin_with_source_mode_and_override(
+            source_mode=requested_source_mode,
+        ),
+    )
+    (
+        _messages,
+        _provider,
+        _model,
+        _bundle,
+        trace,
+    ) = await chat_completion_service.build_messages_for_llm(task)
+
+    assert captured["source_mode"] == requested_source_mode
+    assert trace["source_mode"] == requested_source_mode
+    assert trace["widen_reason"] == WIDEN_REASON_NONE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_source_mode,retrieval_override,expected_source_mode",
+    [
+        (
+            SOURCE_MODE_PROJECT,
+            {"mode": RETRIEVAL_OVERRIDE_PROJECT},
+            SOURCE_MODE_PROJECT,
+        ),
+        (
+            SOURCE_MODE_PROJECT,
+            {"mode": RETRIEVAL_OVERRIDE_PERSONAL_KNOWLEDGE},
+            SOURCE_MODE_PERSONAL_KNOWLEDGE,
+        ),
+        (
+            SOURCE_MODE_PERSONAL_KNOWLEDGE,
+            {"mode": RETRIEVAL_OVERRIDE_NONE},
+            SOURCE_MODE_PERSONAL_KNOWLEDGE,
+        ),
+        (
+            SOURCE_MODE_PERSONAL_KNOWLEDGE,
+            {"mode": RETRIEVAL_OVERRIDE_CONVERSATION},
+            SOURCE_MODE_CONVERSATION,
+        ),
+        (
+            SOURCE_MODE_PERSONAL_KNOWLEDGE,
+            {"mode": "bogus"},
+            SOURCE_MODE_PERSONAL_KNOWLEDGE,
+        ),
+    ],
+)
+async def test_build_messages_for_llm_applies_explicit_retrieval_override_modes_on_queued_task(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_source_mode: str,
+    retrieval_override: dict[str, object],
+    expected_source_mode: str,
+) -> None:
+    captured = _seed_completion_service(monkeypatch)
+
+    task = ChatCompletionTask(
+        user_id="local",
+        thread_id=1,
+        provider="local",
+        model=None,
+        origin=_origin_with_source_mode_and_override(
+            source_mode=requested_source_mode,
+        ),
+        retrieval_override=retrieval_override,
+    )
+    queued_task = task_from_dict(task.to_dict())
+    assert isinstance(queued_task, ChatCompletionTask)
+    assert queued_task.retrieval_override == retrieval_override
+    (
+        _messages,
+        _provider,
+        _model,
+        _bundle,
+        trace,
+    ) = await chat_completion_service.build_messages_for_llm(queued_task)
+
+    assert captured["source_mode"] == expected_source_mode
+    assert trace["source_mode"] == expected_source_mode
+    assert trace["widen_reason"] == WIDEN_REASON_NONE
+
+
+def test_run_chat_completion_task_preserves_routing_debug_metadata_in_payload_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _seed_completion_service(monkeypatch)
+    monkeypatch.setattr(
+        chat_completion_service,
+        "chat_with_ai",
+        lambda *args, **kwargs: "assistant reply",
+    )
+
+    task = ChatCompletionTask(
+        user_id="local",
+        thread_id=1,
+        provider="groq",
+        model="mock-model",
+        origin="api:chat.complete|turn_id=abc|source_mode=project",
+    )
+    task.slash_intent = "slash:search"
+    task.retrieval_override = {"mode": "personal_knowledge"}
+
+    result = chat_completion_service.run_chat_completion_task(
+        task,
+        persist_assistant_message=False,
+    )
+
+    assert captured["source_mode"] == "personal_knowledge"
+    assert result["trace"]["source_mode"] == "personal_knowledge"
+    assert result["trace"]["slash_intent"] == "slash:search"
+    assert result["trace"]["retrieval_override"] == {
+        "mode": "personal_knowledge"
+    }
+    assert result["payload_summary"]["slash_intent"] == "slash:search"
+    assert result["payload_summary"]["retrieval_override"] == {
+        "mode": "personal_knowledge"
+    }
+    assert result["payload_summary"]["source_mode"] == "personal_knowledge"
+    assert result["payload_summary"]["effective_source_mode"] == (
+        "personal_knowledge"
+    )
+
+
+def test_run_chat_completion_task_persists_retrieval_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _seed_completion_service(monkeypatch)
+
+    class _ObsidianOnlyBroker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def assemble(
+            self,
+            thread_id,
+            query,
+            depth_mode,
+            user_id,
+            project_id=None,
+            source_mode=SOURCE_MODE_PROJECT,
+            retrieval_policy=None,
+            **kwargs,
+        ):
+            captured["source_mode"] = source_mode
+            return {
+                "semantic": [
+                    {
+                        "metadata": {
+                            "namespace": OBSIDIAN_NAMESPACE,
+                            "source_id": "obsidian-1",
+                        }
+                    },
+                    {
+                        "metadata": {
+                            "namespace": OBSIDIAN_NAMESPACE,
+                            "source_id": "obsidian-2",
+                        }
+                    },
+                ],
+                "obsidian": [
+                    {"metadata": {"namespace": OBSIDIAN_NAMESPACE}},
+                    {"metadata": {"namespace": OBSIDIAN_NAMESPACE}},
+                ],
+                "docs": {"project": [], "thread": []},
+                "memory": [],
+                "graph": [],
+            }, {
+                "documents": [],
+                "graph": [],
+                "source_mode": source_mode,
+                "widen_reason": WIDEN_REASON_NONE,
+            }
+
+    monkeypatch.setattr(
+        chat_completion_service, "ContextBroker", _ObsidianOnlyBroker
+    )
+    monkeypatch.setattr(
+        chat_completion_service,
+        "chat_with_ai",
+        lambda *args, **kwargs: "assistant reply",
+    )
+
+    class _EmptyStream:
+        def __iter__(self):
+            return iter(())
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        chat_completion_service,
+        "stream_local",
+        lambda *args, **kwargs: _EmptyStream(),
+    )
+
+    task = ChatCompletionTask(
+        user_id="local",
+        thread_id=1,
+        provider="local",
+        model="mock-model",
+        origin="api:chat.complete|turn_id=abc|source_mode=personal_knowledge",
+        requested_source_mode="Personal_Knowledge",
+    )
+    queued_task = task_from_dict(task.to_dict())
+    assert isinstance(queued_task, ChatCompletionTask)
+    assert queued_task.requested_source_mode == "Personal_Knowledge"
+
+    result = chat_completion_service.run_chat_completion_task(
+        queued_task,
+        persist_assistant_message=False,
+    )
+
+    provenance = result["retrieval_provenance"]
+    assert provenance["requested_source_mode"] == "Personal_Knowledge"
+    assert provenance["normalized_source_mode"] == "personal_knowledge"
+    assert provenance["retrieval_status"] == "obsidian_only_success"
+    assert provenance["source_hit_counts"]["obsidian_semantic"] == 2
+    assert provenance["source_hit_counts"]["thread_semantic"] == 0
+    assert result["payload_summary"]["retrieval_provenance"] == provenance
+    assert result["payload_summary"]["graph_hit_count"] == 0
+    assert result["payload_summary"]["graph_enrichment_status"] == (
+        "not_used_yet"
+    )
+    assert (
+        result["payload_summary"]["requested_source_mode"]
+        == "Personal_Knowledge"
+    )
+
+
+def test_run_chat_completion_task_persists_workspace_obsidian_payload_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _seed_completion_service(monkeypatch)
+
+    class _WorkspaceObsidianBroker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def assemble(
+            self,
+            thread_id,
+            query,
+            depth_mode,
+            user_id,
+            project_id=None,
+            source_mode=SOURCE_MODE_PROJECT,
+            retrieval_policy=None,
+            **kwargs,
+        ):
+            captured["source_mode"] = source_mode
+            return {
+                "semantic": [
+                    {
+                        "metadata": {
+                            "namespace": "thread:1",
+                            "message_id": 1,
+                        }
+                    },
+                    {
+                        "metadata": {
+                            "namespace": OBSIDIAN_NAMESPACE,
+                            "source_id": "obsidian-1",
+                        }
+                    },
+                ],
+                "obsidian": [
+                    {
+                        "metadata": {
+                            "namespace": OBSIDIAN_NAMESPACE,
+                            "source_id": "obsidian-1",
+                        }
+                    }
+                ],
+                "docs": {
+                    "project": [{"title": "workspace doc"}],
+                    "thread": [],
+                },
+                "memory": [],
+                "graph": [],
+            }, {
+                "documents": [],
+                "graph": [],
+                "source_mode": source_mode,
+                "widen_reason": WIDEN_REASON_NONE,
+            }
+
+    def _fake_context_system_message_with_meta(bundle):
+        semantic_hits = [
+            item
+            for item in (bundle or {}).get("semantic", [])
+            if isinstance(item, dict)
+        ]
+        obsidian_hits = [
+            item
+            for item in (bundle or {}).get("obsidian", [])
+            if isinstance(item, dict)
+        ]
+        docs = (bundle or {}).get("docs") or {}
+        doc_count = 0
+        if isinstance(docs, dict):
+            for key in ("thread", "project", "library"):
+                value = docs.get(key)
+                if isinstance(value, list):
+                    doc_count += len(value)
+            if not doc_count:
+                doc_count = sum(
+                    len(value)
+                    for value in docs.values()
+                    if isinstance(value, list)
+                )
+        return (
+            "WORKSPACE CONTEXT",
+            {
+                "semantic": {
+                    "count": len(semantic_hits),
+                    "injected": bool(semantic_hits),
+                },
+                "obsidian": {
+                    "count": len(obsidian_hits),
+                    "injected": bool(obsidian_hits),
+                },
+                "docs": {
+                    "count": doc_count,
+                    "injected": bool(doc_count),
+                },
+            },
+        )
+
+    monkeypatch.setattr(
+        chat_completion_service, "ContextBroker", _WorkspaceObsidianBroker
+    )
+    monkeypatch.setattr(
+        chat_completion_service,
+        "build_context_system_message_with_meta",
+        _fake_context_system_message_with_meta,
+    )
+    monkeypatch.setattr(
+        chat_completion_service,
+        "chat_with_ai",
+        lambda *args, **kwargs: "assistant reply",
+    )
+
+    class _EmptyStream:
+        def __iter__(self):
+            return iter(())
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        chat_completion_service,
+        "stream_local",
+        lambda *args, **kwargs: _EmptyStream(),
+    )
+
+    task = ChatCompletionTask(
+        user_id="local",
+        thread_id=1,
+        provider="local",
+        model="mock-model",
+        origin="api:chat.complete|turn_id=abc|source_mode=workspace",
+    )
+
+    result = chat_completion_service.run_chat_completion_task(
+        task,
+        persist_assistant_message=False,
+    )
+
+    provenance = result["retrieval_provenance"]
+    assert captured["source_mode"] == SOURCE_MODE_WORKSPACE
+    assert result["trace"]["source_mode"] == SOURCE_MODE_WORKSPACE
+    assert provenance["retrieval_status"] == "workspace_local_success"
+    assert provenance["source_hit_counts"]["obsidian_semantic"] == 1
+    assert result["payload_summary"]["source_mode"] == SOURCE_MODE_WORKSPACE
+    assert result["payload_summary"]["semantic_count"] == 2
+    assert result["payload_summary"]["obsidian_count"] == 1
+    assert result["payload_summary"]["obsidian_injected"] is True
+    assert result["payload_summary"]["retrieval_injected"] is True
+    assert result["payload_summary"]["linked_document_count"] == 1
+    assert result["payload_summary"]["retrieval_provenance"] == provenance
+
+
+def test_run_chat_completion_task_surfaces_verified_personal_fact_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _seed_completion_service(monkeypatch)
+
+    async def _fake_build_messages_for_llm(_task):
+        captured["source_mode"] = SOURCE_MODE_PROJECT
+        return (
+            [{"role": "system", "content": "SYSTEM"}],
+            "groq",
+            "mock-model",
+            {
+                "verified_personal_facts": [
+                    {
+                        "id": 9,
+                        "key": "home_city",
+                        "value": "NYC",
+                        "user_id": "local",
+                    }
+                ],
+                "verified_personal_facts_context": {
+                    "attempted": True,
+                    "status": "contributed",
+                    "reason": "verified_active_facts",
+                    "count": 1,
+                    "retrieved_count": 1,
+                    "included_ids": [9],
+                    "user_id": "local",
+                    "source_mode": SOURCE_MODE_PROJECT,
+                    "boundary": "project",
+                },
+                "retrieval_provenance": {
+                    "requested_source_mode": "project",
+                    "normalized_source_mode": SOURCE_MODE_PROJECT,
+                    "source_hit_counts": {
+                        "semantic_total": 0,
+                        "thread_semantic": 0,
+                        "obsidian_semantic": 0,
+                        "other_semantic": 0,
+                        "project_documents": 0,
+                        "thread_documents": 0,
+                        "global_documents": 0,
+                        "other_documents": 0,
+                        "memory": 0,
+                        "graph": 0,
+                    },
+                    "retrieval_status": "no_obsidian_results",
+                },
+                "_prompt_meta": {
+                    "context": {
+                        "verified_personal_facts": {
+                            "count": 1,
+                            "injected": True,
+                            "fact_ids": [9],
+                        },
+                        "personal_facts": {
+                            "count": 1,
+                            "injected": True,
+                            "fact_ids": [9],
+                        },
+                    },
+                    "docs": {"count": 0, "injected": False},
+                },
+            },
+            {
+                "source_mode": SOURCE_MODE_PROJECT,
+                "widen_reason": WIDEN_REASON_NONE,
+            },
+        )
+
+    monkeypatch.setattr(
+        chat_completion_service,
+        "build_messages_for_llm",
+        _fake_build_messages_for_llm,
+    )
+    monkeypatch.setattr(
+        chat_completion_service,
+        "build_context_system_message_with_meta",
+        lambda bundle: (
+            "Verified Personal Facts:\n- home_city: NYC",
+            {
+                "verified_personal_facts": {
+                    "count": 1,
+                    "injected": True,
+                    "fact_ids": [9],
+                },
+                "personal_facts": {
+                    "count": 1,
+                    "injected": True,
+                    "fact_ids": [9],
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        chat_completion_service,
+        "chat_with_ai",
+        lambda *args, **kwargs: "assistant reply",
+    )
+
+    task = ChatCompletionTask(
+        user_id="local",
+        thread_id=1,
+        provider="groq",
+        model="mock-model",
+        origin="api:chat.complete|turn_id=abc|source_mode=project",
+    )
+
+    result = chat_completion_service.run_chat_completion_task(
+        task,
+        persist_assistant_message=False,
+    )
+
+    assert captured["source_mode"] == SOURCE_MODE_PROJECT
+    assert result["payload_summary"]["verified_personal_facts_count"] == 1
+    assert result["payload_summary"]["verified_personal_facts_injected"] is True
+    assert result["payload_summary"]["verified_personal_fact_ids"] == [9]
+    assert result["payload_summary"]["verified_personal_facts_count"] == 1

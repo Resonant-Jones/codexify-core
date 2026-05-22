@@ -1,0 +1,14 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/**
+ * Traverses up the process tree from the current process to find the top-level ancestor process ID.
+ * This is useful for identifying the main application process that spawned the current script,
+ * such as the main VS Code window process.
+ *
+ * @returns A promise that resolves to the numeric PID of the top-level process.
+ * @throws Will throw an error if the underlying shell commands fail unexpectedly.
+ */
+export declare function getIdeProcessId(): Promise<number>;

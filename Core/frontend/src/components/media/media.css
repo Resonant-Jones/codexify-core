@@ -1,0 +1,83 @@
+/* Shared media grid and tile styles for Dashboard and Gallery */
+
+/* Responsive grid with centering */
+.codexifyMediaGrid {
+  --tile-size: 256px;
+  --tile-chrome: 3px;
+  --tile-gutter: 6px;
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  grid-template-columns: repeat(
+    auto-fit,
+    minmax(
+      min(
+        100%,
+        calc(var(--tile-size) + (var(--tile-chrome) * 2))
+      ),
+      calc(var(--tile-size) + (var(--tile-chrome) * 2))
+    )
+  );
+  gap: var(--tile-gutter);
+  align-items: start;
+  align-content: start;
+  justify-content: space-between;
+}
+
+.codexifyMediaGrid--dashboard-image {
+  --tile-size: 192px;
+  grid-template-columns: repeat(4, minmax(0, var(--tile-size)));
+  justify-content: flex-start;
+}
+
+.codexifyMediaGrid--gallery {
+  --tile-size: 168px;
+}
+
+/* Tile wrapper */
+.codexifyMediaTile {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  transition: transform 150ms ease-out;
+}
+
+.codexifyMediaTile > * {
+  pointer-events: none;
+}
+
+.codexifyMediaTile:hover {
+  transform: translateY(-2px);
+}
+
+.codexifyMediaTile:focus-visible {
+  outline: 2px solid var(--accent-strong, #3b82f6);
+  outline-offset: 2px;
+}
+
+/* Media content */
+.codexifyMediaTileMedia {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.codexifyMediaTileFallback {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background:
+    radial-gradient(circle at top, color-mix(in oklab, var(--accent-strong, #3b82f6) 18%, transparent), transparent 58%),
+    color-mix(in oklab, var(--panel-bg, rgba(15, 23, 42, 0.85)) 92%, black 8%);
+  color: color-mix(in oklab, var(--text, #f8fafc) 72%, transparent);
+}
+
+.codexifyMediaTileFallbackLabel {
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}

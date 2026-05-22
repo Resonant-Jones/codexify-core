@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2.0.0-rc",
+  "productName": "Codexify",
+  "version": "0.1.0",
+  "identifier": "com.codexify.desktop",
+  "mainBinaryName": "Codexify",
+  "build": {
+    "frontendDist": "../frontend/src/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm --dir frontend/src dev",
+    "beforeBuildCommand": "pnpm --dir frontend/src build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Codexify",
+        "width": 1440,
+        "height": 900,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "resources": {
+      "./target/bundle-resources/.env.example": ".env.example",
+      "./target/bundle-resources/.env.template": ".env.template",
+      "./target/bundle-resources/backend": "backend",
+      "./target/bundle-resources/docker": "docker",
+      "./target/bundle-resources/docker-compose.runtime.yml": "docker-compose.runtime.yml",
+      "./target/bundle-resources/guardian": "guardian",
+      "./target/bundle-resources/plugins": "plugins",
+      "./target/bundle-resources/pytest.ini": "pytest.ini",
+      "./target/bundle-resources/requirements": "requirements",
+      "./target/bundle-resources/requirements.txt": "requirements.txt",
+      "./target/bundle-resources/scripts": "scripts",
+      "./target/bundle-resources/tests": "tests"
+    },
+    "macOS": {
+      "bundleName": "Codexify",
+      "bundleVersion": "0.1.0"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

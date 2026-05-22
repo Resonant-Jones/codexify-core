@@ -1,0 +1,211 @@
+.codexifyWorkspacePane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.codexifyWorkspacePaneHeader {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 12px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.codexifyWorkspacePaneHeaderTitle {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.codexifyWorkspacePaneHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  min-width: 0;
+}
+
+.codexifyWorkspaceViewer {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  background: var(--panel-bg);
+  color: var(--text);
+}
+
+.codexifyWorkspacePreviewSurface {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  border: 1px solid var(--panel-border);
+  border-radius: 18px;
+  padding: 12px;
+  background: color-mix(in oklab, var(--panel-bg) 94%, transparent);
+}
+
+.codexifyWorkspaceViewer--embed {
+  padding: 0;
+  overflow: hidden;
+}
+
+.codexifyWorkspaceViewer--image {
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.codexifyWorkspaceViewer iframe,
+.codexifyWorkspaceViewer embed,
+.codexifyWorkspaceViewer object,
+.codexifyWorkspaceMediaPreview iframe,
+.codexifyWorkspaceMediaPreview embed,
+.codexifyWorkspaceMediaPreview object {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+
+.codexifyWorkspaceImage {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.codexifyWorkspaceHint {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.codexifyWorkspaceLink {
+  margin-top: 0.5rem;
+  display: inline-block;
+  color: rgb(59 130 246);
+  text-decoration: none;
+}
+
+.codexifyWorkspaceLink:hover {
+  text-decoration: underline;
+}
+
+.codexifyWorkspaceMetadata {
+  flex: 0 0 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0 2px 2px;
+}
+
+.codexifyWorkspaceMetadataHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.codexifyWorkspaceMetadataTitle {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.codexifyWorkspaceMetadataGrid {
+  display: grid;
+  gap: 0.5rem 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  margin: 0;
+}
+
+.codexifyWorkspaceMetadataItem dt {
+  font-size: 0.6875rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.codexifyWorkspaceMetadataItem dd {
+  margin: 0.15rem 0 0;
+  color: var(--text);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+
+.codexifyWorkspaceError {
+  color: rgb(248 113 113);
+  font-size: 0.875rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.codexifyWorkspaceErrorTitle {
+  font-weight: 600;
+}
+
+.codexifyWorkspaceMarkdown {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.codexifyWorkspacePlaintext {
+  margin: 0;
+  width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace;
+  font-size: 0.875rem;
+  line-height: 1.65;
+}
+
+.codexifyWorkspaceState {
+  display: flex;
+  min-height: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 0.35rem;
+  color: var(--muted);
+}
+
+.codexifyWorkspaceState--muted {
+  color: var(--muted);
+}
+
+.codexifyWorkspaceState--error {
+  color: rgb(248 113 113);
+}
+
+.codexifyWorkspaceStateTitle {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.codexifyWorkspaceState--error .codexifyWorkspaceStateTitle {
+  color: rgb(248 113 113);
+}
+
+.codexifyWorkspaceMediaPreview {
+  width: 100%;
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}

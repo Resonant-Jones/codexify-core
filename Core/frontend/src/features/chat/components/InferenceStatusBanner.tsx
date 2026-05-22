@@ -1,0 +1,136 @@
+import { Loader2 } from "lucide-react";
+
+import type { InferenceRequestState } from "@/types/inference";
+
+type InferenceStatusBannerProps = {
+  state: InferenceRequestState;
+  onCancel?: () => void;
+  onSwitchToFast?: () => void;
+};
+
+function isVisibleState(state: InferenceRequestState): boolean {
+  return (
+    state.phase === "sending" ||
+    state.phase === "thinking" ||
+    state.phase === "streaming" ||
+    state.phase === "failed" ||
+    state.phase === "cancelled" ||
+    (state.phase === "completed" && (state.latencyMetrics?.length ?? 0) > 0)
+  );
+}
+
+export function InferenceStatusBanner({
+  state,
+  onCancel,
+  onSwitchToFast,
+}: InferenceStatusBannerProps) {
+  if (!isVisibleState(state)) {
+    return null;
+  }
+
+  const isActive =
+    state.phase === "sending" ||
+    state.phase === "thinking" ||
+    state.phase === "streaming";
+
+  const isPendingStop = state.isPendingCancel;
+  const latencyMetrics = state.latencyMetrics ?? [];
+  const label = (() => {
+    if (isPendingStop) return "Stopping…";
+    if (state.phase === "failed") return "Reply failed";
+    if (state.phase === "cancelled") return "Reply stopped";
+    if (state.phase === "completed") return "Completed";
+    if (state.statusText) return state.statusText;
+    if (state.phase === "thinking") return "Thinking…";
+    if (state.phase === "streaming") return "Replying…";
+    if (state.phase === "sending") return "Sending…";
+    return state.statusText ?? "Working…";
+  })();
+
+  const detail =
+    state.detailText ??
+    (state.phase === "thinking"
+      ? "This may take a few minutes."
+      : state.phase === "failed"
+        ? state.errorText
+        : null);
+
+  const tone =
+    state.phase === "failed"
+      ? "rgb(248 113 113)"
+      : state.phase === "cancelled"
+        ? "rgb(148 163 184)"
+        : "var(--muted)";
+
+  return (
+    <div className="flex items-start justify-between gap-3" aria-live="polite">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 text-[11px]">
+          {isActive ? (
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" style={{ color: tone }} />
+          ) : (
+            <span
+              className="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
+              style={{ background: tone }}
+            />
+          )}
+          <span className="truncate font-medium" style={{ color: "var(--text)" }}>
+            {label}
+          </span>
+          {detail ? (
+            <span className="hidden truncate sm:inline" style={{ color: "var(--muted)" }}>
+              {detail}
+            </span>
+          ) : null}
+        </div>
+        {latencyMetrics.length > 0 ? (
+          <div
+            className="mt-1 flex flex-wrap gap-1 pl-5 text-[10px]"
+            data-testid="inference-latency-readout"
+          >
+            {latencyMetrics.map((metric) => (
+              <span
+                key={metric.label}
+                className="inline-flex items-center rounded-full border px-2 py-0.5 leading-none"
+                style={{
+                  borderColor: "color-mix(in oklab, var(--muted) 18%, transparent)",
+                  background:
+                    "color-mix(in oklab, var(--panel-bg, transparent) 82%, transparent)",
+                  color: "var(--muted)",
+                }}
+              >
+                {metric.label}: {metric.value}
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </div>
+      <div className="flex shrink-0 items-center gap-3 text-[11px]">
+        {state.canCancel && onCancel ? (
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={state.isPendingCancel}
+            className="transition-opacity hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-45"
+            style={{ color: "var(--muted)" }}
+          >
+            Stop
+          </button>
+        ) : null}
+        {state.canSwitchToFast && onSwitchToFast ? (
+          <button
+            type="button"
+            onClick={onSwitchToFast}
+            disabled={state.isPendingCancel}
+            className="transition-opacity hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-45"
+            style={{ color: "var(--muted)" }}
+          >
+            No Think
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+export default InferenceStatusBanner;

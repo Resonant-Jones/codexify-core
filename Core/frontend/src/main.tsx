@@ -1,0 +1,145 @@
+import "./index.css";
+import "./styles/interaction.css";
+import React from "react";
+import ReactDOM from "react-dom/client";
+
+import App from "./App";
+import { configureGC } from "./dcw-services/gc";
+import {
+  refreshApiBaseUrl,
+  readRuntimeApiKey,
+  getDevApiKey,
+  setRuntimeApiKey,
+} from "./lib/api";
+import { resolveAuthStateOnBoot } from "./lib/authState";
+import { GuardianAPI } from "./lib/guardianApi";
+import {
+  getRuntimeConfigSync,
+  initRuntimeConfig,
+  getDesktopRuntimeAuthConfig,
+  invokeTauriCommand,
+  isTauriRuntime,
+} from "./lib/runtimeConfig";
+import { injectCssVars } from "./theme";
+
+;(window as any).GuardianAPI = GuardianAPI;
+
+declare global {
+  interface Window {
+    __GC_ENV__?: any;
+  }
+}
+
+declare global {
+  interface Window {
+    getComputedStyleVar?: (name: string, el?: Element) => string;
+  }
+}
+
+if (typeof window !== "undefined") {
+  window.getComputedStyleVar = (
+    name: string,
+    el: Element = document.documentElement
+  ) => getComputedStyle(el).getPropertyValue(name).trim();
+}
+
+injectCssVars();
+
+function readDevApiKey(): string {
+  return getDevApiKey();
+}
+
+async function hydrateDesktopApiKey(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  if (readRuntimeApiKey()) return;
+  try {
+    const value = await invokeTauriCommand<string | null>("desktop_get_api_key");
+    setRuntimeApiKey(typeof value === "string" ? value : null);
+  } catch (error) {
+    console.warn("[desktop-auth] Unable to hydrate API key from secure store", error);
+  }
+}
+
+function renderApp(): void {
+  const rootEl = document.getElementById("root");
+  if (!rootEl) {
+    console.error("[gc] #root element not found — cannot mount React app.");
+    return;
+  }
+
+  ReactDOM.createRoot(rootEl).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>
+  );
+}
+
+async function bootstrap(): Promise<void> {
+  try {
+    const runtimeConfig = await initRuntimeConfig();
+    const runtimeAuthConfig = getDesktopRuntimeAuthConfig();
+    refreshApiBaseUrl();
+
+    const devApiKey = readDevApiKey();
+    const runtimeApiKey = readRuntimeApiKey();
+    configureGC({
+      base: runtimeConfig.apiBaseUrl,
+      token: runtimeApiKey || devApiKey || undefined,
+    });
+
+    await hydrateDesktopApiKey();
+    configureGC({
+      base: runtimeConfig.apiBaseUrl,
+      token: readRuntimeApiKey() || devApiKey || undefined,
+    });
+    resolveAuthStateOnBoot();
+
+    (window as any).__GC_ENV__ = {
+      mode: import.meta.env.MODE,
+      runtimeMode: runtimeConfig.mode,
+      base: runtimeConfig.apiBaseUrl,
+      backendBase: runtimeConfig.backendBaseUrl,
+      sse: runtimeConfig.sseUrl,
+      keyPresent: !!(readRuntimeApiKey() || devApiKey),
+      apiKeyPresent: !!runtimeAuthConfig?.apiKeyPresent,
+      envPath: runtimeAuthConfig?.envPath ?? null,
+      runtimeRoot: runtimeAuthConfig?.runtimeRoot ?? null,
+      failureKind: runtimeAuthConfig?.failureKind ?? null,
+    };
+    console.info("[gc] env snapshot", {
+      mode: (window as any).__GC_ENV__?.mode,
+      runtimeMode: (window as any).__GC_ENV__?.runtimeMode,
+      base: (window as any).__GC_ENV__?.base,
+      backendBase: (window as any).__GC_ENV__?.backendBase,
+      keyPresent: (window as any).__GC_ENV__?.keyPresent,
+      apiKeyPresent: (window as any).__GC_ENV__?.apiKeyPresent,
+      envPath: (window as any).__GC_ENV__?.envPath,
+      runtimeRoot: (window as any).__GC_ENV__?.runtimeRoot,
+      failureKind: (window as any).__GC_ENV__?.failureKind,
+    });
+
+    if (!devApiKey && import.meta.env.DEV) {
+      console.info(
+        "[gc] Dev API key override disabled. Provide VITE_GUARDIAN_DEV_API_KEY only when needed for local-safe auth."
+      );
+    } else if (devApiKey) {
+      const masked = String(devApiKey);
+      console.info("[gc] Backend configured:", {
+        base: runtimeConfig.apiBaseUrl,
+        key: `${masked.slice(0, 4)}…${masked.slice(-4)}`,
+      });
+    }
+  } catch (error) {
+    console.error("[gc] bootstrap failed", error);
+  }
+}
+
+// Render immediately so a slow or failed bootstrap never leaves the window blank.
+const initialRuntimeConfig = getRuntimeConfigSync();
+configureGC({
+  base: initialRuntimeConfig.apiBaseUrl,
+  token: readRuntimeApiKey() || readDevApiKey() || undefined,
+});
+resolveAuthStateOnBoot();
+void bootstrap();
+renderApp();

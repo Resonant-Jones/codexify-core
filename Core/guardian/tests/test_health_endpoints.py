@@ -1,0 +1,675 @@
+import json
+
+import pytest
+import requests
+from fastapi.testclient import TestClient
+
+from guardian.guardian_api import app
+from guardian.routes import health as health_routes
+
+
+class _FakeRedisClient:
+    def __init__(self, heartbeat_value=None, queue_depth=0):
+        self.heartbeat_value = heartbeat_value
+        self.queue_depth = queue_depth
+
+    def ping(self):
+        return True
+
+    def lpush(self, *args, **kwargs):
+        return 1
+
+    def rpop(self, *args, **kwargs):
+        return b"ok"
+
+    def delete(self, *args, **kwargs):
+        return 1
+
+    def get(self, key):
+        return self.heartbeat_value
+
+    def llen(self, key):
+        return self.queue_depth
+
+
+@pytest.fixture(autouse=True)
+def reset_chat_queue_progress_state():
+    health_routes._CHAT_QUEUE_LAST_DEPTH = None
+    health_routes._CHAT_QUEUE_LAST_CHECK_TS = 0.0
+    yield
+    health_routes._CHAT_QUEUE_LAST_DEPTH = None
+    health_routes._CHAT_QUEUE_LAST_CHECK_TS = 0.0
+
+
+def _fresh_completion_service() -> dict[str, object]:
+    return {
+        "ok": True,
+        "redis_reachable": True,
+        "enqueue_test_ok": True,
+        "worker_heartbeat_detected": True,
+        "worker_heartbeat_age_seconds": 0.5,
+        "worker_heartbeat_status": "fresh",
+        "status_reason": "ok",
+        "error": None,
+    }
+
+
+def test_health_endpoints_ok():
+    client = TestClient(app)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json().get("status") == "ok"
+
+    deps = client.get("/health/deps")
+    assert deps.status_code == 200
+    data = deps.json()
+    assert data.get("status") == "ok"
+
+
+def test_health_reports_no_release_hold_for_local_only_settings(monkeypatch):
+    from guardian.core.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        OPENAI_API_KEY=None,
+        GROQ_API_KEY=None,
+        ALIBABA_API_KEY=None,
+        MINIMAX_API_KEY=None,
+    )
+    monkeypatch.setattr("guardian.core.config.get_settings", lambda: settings)
+
+    client = TestClient(app)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+
+    payload = resp.json()
+    assert payload["release_hold"] is False
+    assert payload["details"]["release_hold"] is False
+
+
+def test_health_llm_reports_local_online(monkeypatch):
+    from guardian.core.config import get_settings
+
+    settings = get_settings()
+    prev_provider = settings.LLM_PROVIDER
+    prev_local_base = settings.LOCAL_BASE_URL
+
+    settings.LLM_PROVIDER = "local"
+    settings.LOCAL_BASE_URL = "http://127.0.0.1:11434/v1"
+
+    class _Resp:
+        status_code = 200
+
+    monkeypatch.setattr(
+        "guardian.routes.health.requests.get", lambda *a, **k: _Resp()
+    )
+
+    client = TestClient(app)
+    try:
+        resp = client.get("/api/health/llm")
+        assert resp.status_code == 200
+        payload = resp.json()
+        details = payload["details"]
+        assert details.get("ok") is True
+        assert payload.get("status") == "ok"
+        assert details.get("status") == "online"
+        assert details.get("provider") == "local"
+        assert details["provider_truth"]["configured"] is True
+        assert details["provider_truth"]["discoverable"] is True
+        assert details["provider_truth"]["selectable"] is True
+    finally:
+        settings.LLM_PROVIDER = prev_provider
+        settings.LOCAL_BASE_URL = prev_local_base
+
+
+def test_health_llm_release_hold_ignores_bundled_cloud_defaults(monkeypatch):
+    from guardian.core.config import get_settings
+
+    class _Resolution:
+        model = "library2/ministral-3:8b"
+        failure_kind = None
+        message = None
+        endpoint_resolution = {"state": "available"}
+
+        def as_dict(self):
+            return {
+                "model": self.model,
+                "failure_kind": self.failure_kind,
+                "message": self.message,
+                "endpoint_resolution": self.endpoint_resolution,
+            }
+
+    settings = get_settings()
+    snapshot = {
+        "LLM_PROVIDER": settings.LLM_PROVIDER,
+        "ALLOW_CLOUD_PROVIDERS": settings.ALLOW_CLOUD_PROVIDERS,
+        "CODEXIFY_LOCAL_ONLY_MODE": settings.CODEXIFY_LOCAL_ONLY_MODE,
+        "CODEXIFY_EGRESS_ALLOWLIST": settings.CODEXIFY_EGRESS_ALLOWLIST,
+        "OPENAI_API_KEY": settings.OPENAI_API_KEY,
+        "GROQ_API_KEY": settings.GROQ_API_KEY,
+        "MINIMAX_API_KEY": settings.MINIMAX_API_KEY,
+        "MINIMAX_API_BASE": settings.MINIMAX_API_BASE,
+        "ALIBABA_API_KEY": settings.ALIBABA_API_KEY,
+        "ALIBABA_API_BASE": settings.ALIBABA_API_BASE,
+    }
+
+    monkeypatch.setattr(
+        "guardian.routes.health._collect_completion_service_health",
+        lambda: {
+            "ok": True,
+            "redis_reachable": True,
+            "enqueue_test_ok": True,
+            "worker_heartbeat_detected": True,
+            "worker_heartbeat_age_seconds": 0.5,
+            "status_reason": "ok",
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        "guardian.routes.health._probe_local_llm",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "status": "online",
+            "checked_endpoint": "/healthz",
+        },
+    )
+    monkeypatch.setattr(
+        "guardian.core.ai_router._resolve_local_base",
+        lambda settings: "http://127.0.0.1:11434/v1",
+    )
+    monkeypatch.setattr(
+        "guardian.core.ai_router.resolve_local_execution_model",
+        lambda **kwargs: _Resolution(),
+    )
+
+    settings.LLM_PROVIDER = "local"
+    settings.ALLOW_CLOUD_PROVIDERS = False
+    settings.CODEXIFY_LOCAL_ONLY_MODE = True
+    settings.CODEXIFY_EGRESS_ALLOWLIST = ""
+    settings.OPENAI_API_KEY = None
+    settings.GROQ_API_KEY = None
+    settings.MINIMAX_API_KEY = None
+    settings.MINIMAX_API_BASE = settings.MINIMAX_API_BASE
+    settings.ALIBABA_API_KEY = None
+    settings.ALIBABA_API_BASE = settings.ALIBABA_API_BASE
+
+    client = TestClient(app)
+    try:
+        resp = client.get("/api/health/llm")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["release_hold"] is False
+        assert payload["details"]["release_hold"] is False
+    finally:
+        for field, value in snapshot.items():
+            setattr(settings, field, value)
+
+
+def test_health_surfaces_missing_supported_profile_explicitly(monkeypatch):
+    from guardian.core.config import get_settings
+
+    monkeypatch.setattr(
+        "guardian.routes.health.requests.get",
+        lambda *args, **kwargs: type("Resp", (), {"status_code": 200})(),
+    )
+    monkeypatch.setattr(
+        health_routes,
+        "_collect_completion_service_health",
+        _fresh_completion_service,
+    )
+    client = TestClient(app)
+
+    settings = get_settings()
+    snapshot = {
+        "LLM_PROVIDER": settings.LLM_PROVIDER,
+        "ALLOW_CLOUD_PROVIDERS": settings.ALLOW_CLOUD_PROVIDERS,
+        "CODEXIFY_LOCAL_ONLY_MODE": settings.CODEXIFY_LOCAL_ONLY_MODE,
+        "CODEXIFY_EGRESS_ALLOWLIST": settings.CODEXIFY_EGRESS_ALLOWLIST,
+        "OPENAI_API_KEY": settings.OPENAI_API_KEY,
+        "GROQ_API_KEY": settings.GROQ_API_KEY,
+        "MINIMAX_API_KEY": settings.MINIMAX_API_KEY,
+        "ALIBABA_API_KEY": settings.ALIBABA_API_KEY,
+    }
+    try:
+        settings.LLM_PROVIDER = "local"
+        settings.ALLOW_CLOUD_PROVIDERS = False
+        settings.CODEXIFY_LOCAL_ONLY_MODE = True
+        settings.CODEXIFY_EGRESS_ALLOWLIST = ""
+        settings.OPENAI_API_KEY = None
+        settings.GROQ_API_KEY = None
+        settings.MINIMAX_API_KEY = None
+        settings.ALIBABA_API_KEY = None
+
+        response = client.get("/health")
+        assert response.status_code == 200
+        payload = response.json()
+        supported_profile = payload["details"]["supported_profile"]
+        assert supported_profile["valid"] is False
+        assert supported_profile["release_hold"] is True
+        assert any(
+            "not configured" in mismatch.lower()
+            for mismatch in supported_profile["mismatches"]
+        )
+
+        response = client.get("/api/health/llm")
+        assert response.status_code == 200
+        details = response.json()["details"]
+        supported_profile = details["supported_profile"]
+        assert supported_profile["valid"] is False
+        assert supported_profile["release_hold"] is True
+        assert any(
+            "not configured" in mismatch.lower()
+            for mismatch in supported_profile["mismatches"]
+        )
+    finally:
+        client.close()
+        for field, value in snapshot.items():
+            setattr(settings, field, value)
+
+
+def test_health_llm_cloud_configured_is_truthful_unknown(monkeypatch):
+    from guardian.core.config import get_settings
+
+    settings = get_settings()
+    snapshot = {
+        "LLM_PROVIDER": settings.LLM_PROVIDER,
+        "ALLOW_CLOUD_PROVIDERS": settings.ALLOW_CLOUD_PROVIDERS,
+        "CODEXIFY_LOCAL_ONLY_MODE": settings.CODEXIFY_LOCAL_ONLY_MODE,
+        "CODEXIFY_EGRESS_ALLOWLIST": settings.CODEXIFY_EGRESS_ALLOWLIST,
+        "GROQ_API_KEY": settings.GROQ_API_KEY,
+    }
+
+    monkeypatch.setattr(
+        "guardian.routes.health._collect_completion_service_health",
+        lambda: {
+            "ok": True,
+            "redis_reachable": True,
+            "enqueue_test_ok": True,
+            "worker_heartbeat_detected": True,
+            "worker_heartbeat_age_seconds": 0.5,
+            "status_reason": "ok",
+            "error": None,
+        },
+    )
+
+    settings.LLM_PROVIDER = "groq"
+    settings.ALLOW_CLOUD_PROVIDERS = True
+    settings.CODEXIFY_LOCAL_ONLY_MODE = False
+    settings.CODEXIFY_EGRESS_ALLOWLIST = "groq"
+    settings.GROQ_API_KEY = "groq-key"
+
+    client = TestClient(app)
+    try:
+        resp = client.get("/api/health/llm")
+        assert resp.status_code == 200
+        payload = resp.json()
+        details = payload["details"]
+        assert details["provider"] == "groq"
+        assert payload["status"] == "degraded"
+        assert details["status"] == "unknown"
+        assert details["ok"] is False
+        assert details["mode"] == "runtime_unprobed"
+        assert details["provider_runtime"]["enabled"] is True
+        assert details["completion_service"]["status_reason"] == "ok"
+        assert details["provider_truth"]["configured"] is True
+        assert details["provider_truth"]["authorized"] is True
+        assert details["provider_truth"]["selectable"] is True
+    finally:
+        for field, value in snapshot.items():
+            setattr(settings, field, value)
+
+
+def test_health_and_catalog_share_dynamic_provider_model_index_state(
+    monkeypatch,
+):
+    from guardian.core.config import get_settings
+
+    class _Resp:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+    settings = get_settings()
+    snapshot = {
+        "LLM_PROVIDER": settings.LLM_PROVIDER,
+        "ALLOW_CLOUD_PROVIDERS": settings.ALLOW_CLOUD_PROVIDERS,
+        "CODEXIFY_LOCAL_ONLY_MODE": settings.CODEXIFY_LOCAL_ONLY_MODE,
+        "CODEXIFY_EGRESS_ALLOWLIST": settings.CODEXIFY_EGRESS_ALLOWLIST,
+        "MINIMAX_API_KEY": settings.MINIMAX_API_KEY,
+        "MINIMAX_API_BASE": settings.MINIMAX_API_BASE,
+        "MINIMAX_API_FLAVOR": settings.MINIMAX_API_FLAVOR,
+        "MINIMAX_MODEL": settings.MINIMAX_MODEL,
+    }
+
+    monkeypatch.setattr(
+        "guardian.routes.health._collect_completion_service_health",
+        lambda: {
+            "ok": True,
+            "redis_reachable": True,
+            "enqueue_test_ok": True,
+            "worker_heartbeat_detected": True,
+            "worker_heartbeat_age_seconds": 0.5,
+            "status_reason": "ok",
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        "guardian.core.llm_catalog.requests.get",
+        lambda url, *args, **kwargs: _Resp({"data": []}, status_code=404),
+    )
+    monkeypatch.setattr(
+        "guardian.core.provider_registry.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            requests.exceptions.Timeout("timed out")
+        ),
+    )
+
+    settings.LLM_PROVIDER = "minimax"
+    settings.ALLOW_CLOUD_PROVIDERS = True
+    settings.CODEXIFY_LOCAL_ONLY_MODE = False
+    settings.CODEXIFY_EGRESS_ALLOWLIST = "minimax"
+    settings.MINIMAX_API_KEY = "minimax-key"
+    settings.MINIMAX_API_BASE = "https://api.minimax.local/v1"
+    settings.MINIMAX_API_FLAVOR = "openai"
+    settings.MINIMAX_MODEL = "minimax-chat"
+
+    client = TestClient(app)
+    try:
+        health = client.get("/api/health/llm")
+        assert health.status_code == 200
+        health_payload = health.json()
+        health_details = health_payload["details"]
+
+        catalog = client.get("/api/llm/catalog")
+        assert catalog.status_code == 200
+        catalog_payload = catalog.json()
+        minimax = next(
+            provider
+            for provider in catalog_payload["providers"]
+            if provider["id"] == "minimax"
+        )
+
+        assert health_details["provider"] == "minimax"
+        assert health_details["model"] == "minimax-chat"
+        assert (
+            health_details["provider_runtime"]["model_index"]
+            == minimax["model_index"]
+        )
+        assert (
+            health_details["provider_runtime"]["available"]
+            == minimax["available"]
+        )
+        assert (
+            health_details["provider_runtime"]["enabled"] == minimax["enabled"]
+        )
+        assert (
+            health_details["provider_truth"]["configured"]
+            == minimax["truth"]["configured"]
+        )
+        assert (
+            health_details["provider_truth"]["authorized"]
+            == minimax["truth"]["authorized"]
+        )
+        assert (
+            health_details["provider_truth"]["selectable"]
+            == minimax["truth"]["selectable"]
+        )
+        assert minimax["model_index"]["state"] == "degraded"
+        assert "timed out" in minimax["model_index"]["reason"].lower()
+    finally:
+        for field, value in snapshot.items():
+            setattr(settings, field, value)
+
+
+def test_completion_service_health_computes_heartbeat_age(monkeypatch):
+    fixed_now = 1_700_000_000.0
+    heartbeat_age = 27.5
+    heartbeat_payload = json.dumps({"ts": fixed_now - heartbeat_age}).encode(
+        "utf-8"
+    )
+
+    monkeypatch.setattr(
+        "guardian.queue.redis_queue.get_redis_client",
+        lambda: _FakeRedisClient(heartbeat_payload, queue_depth=0),
+    )
+    monkeypatch.setattr(health_routes.time, "time", lambda: fixed_now)
+
+    payload = health_routes._collect_completion_service_health()
+
+    assert payload["redis_reachable"] is True
+    assert payload["worker_heartbeat_detected"] is True
+    assert payload["worker_heartbeat_status"] == "stale"
+    assert payload["worker_heartbeat_age_seconds"] == pytest.approx(
+        heartbeat_age, abs=0.001
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "completion_service",
+        "expected_ok",
+        "expected_status",
+        "expected_worker_status",
+        "expected_note",
+    ),
+    [
+        (
+            {
+                "redis_reachable": True,
+                "enqueue_test_ok": False,
+                "worker_heartbeat_detected": True,
+                "worker_heartbeat_age_seconds": 0.5,
+                "status_reason": "queue_enqueue_failed",
+                "error": None,
+            },
+            False,
+            "unhealthy",
+            "fresh",
+            "queue round-trip probe failed",
+        ),
+        (
+            {
+                "redis_reachable": True,
+                "enqueue_test_ok": True,
+                "worker_heartbeat_detected": True,
+                "worker_heartbeat_age_seconds": 0.5,
+                "status_reason": "ok",
+                "error": None,
+            },
+            True,
+            "healthy",
+            "fresh",
+            "queue empty",
+        ),
+        (
+            {
+                "redis_reachable": True,
+                "enqueue_test_ok": True,
+                "worker_heartbeat_detected": True,
+                "worker_heartbeat_age_seconds": 10.0,
+                "status_reason": "ok",
+                "error": None,
+            },
+            True,
+            "healthy",
+            "fresh",
+            "queue empty",
+        ),
+        (
+            {
+                "redis_reachable": True,
+                "enqueue_test_ok": True,
+                "worker_heartbeat_detected": True,
+                "worker_heartbeat_age_seconds": 10.001,
+                "status_reason": "ok",
+                "error": None,
+            },
+            False,
+            "degraded",
+            "stale",
+            "worker heartbeat stale",
+        ),
+        (
+            {
+                "redis_reachable": True,
+                "enqueue_test_ok": True,
+                "worker_heartbeat_detected": True,
+                "worker_heartbeat_age_seconds": 60.0,
+                "status_reason": "ok",
+                "error": None,
+            },
+            False,
+            "degraded",
+            "stale",
+            "worker heartbeat stale",
+        ),
+        (
+            {
+                "redis_reachable": True,
+                "enqueue_test_ok": True,
+                "worker_heartbeat_detected": True,
+                "worker_heartbeat_age_seconds": 60.001,
+                "status_reason": "ok",
+                "error": None,
+            },
+            False,
+            "unhealthy",
+            "dead",
+            "worker heartbeat dead",
+        ),
+        (
+            {
+                "redis_reachable": True,
+                "enqueue_test_ok": True,
+                "worker_heartbeat_detected": False,
+                "worker_heartbeat_age_seconds": None,
+                "status_reason": "worker_heartbeat_missing",
+                "error": None,
+            },
+            False,
+            "unhealthy",
+            "dead",
+            "worker heartbeat missing",
+        ),
+        (
+            {
+                "redis_reachable": False,
+                "enqueue_test_ok": False,
+                "worker_heartbeat_detected": False,
+                "worker_heartbeat_age_seconds": None,
+                "status_reason": "redis_unreachable",
+                "error": None,
+            },
+            False,
+            "unhealthy",
+            "dead",
+            "redis unreachable",
+        ),
+    ],
+)
+def test_health_chat_classifies_worker_freshness(
+    monkeypatch,
+    completion_service,
+    expected_ok,
+    expected_status,
+    expected_worker_status,
+    expected_note,
+):
+    monkeypatch.setattr(
+        health_routes,
+        "_collect_completion_service_health",
+        lambda: completion_service,
+    )
+    monkeypatch.setattr(
+        "guardian.queue.redis_queue.get_redis_client",
+        lambda: _FakeRedisClient(queue_depth=0),
+    )
+
+    client = TestClient(app)
+    resp = client.get("/health/chat")
+    assert resp.status_code == 200
+
+    payload = resp.json()
+    assert payload["ok"] is expected_ok
+    assert payload["status"] == expected_status
+    assert payload["queue"]["depth"] == 0
+    assert payload["queue"]["status"] == "progressing"
+    assert payload["redis"] == (
+        "ok"
+        if completion_service["redis_reachable"]
+        and completion_service["enqueue_test_ok"]
+        else "unhealthy"
+    )
+    assert payload["worker"]["status"] == expected_worker_status
+    assert payload["provider_truth"]["configured"] is True
+    if completion_service["worker_heartbeat_detected"]:
+        assert (
+            payload["worker"]["heartbeat_age_seconds"]
+            == completion_service["worker_heartbeat_age_seconds"]
+        )
+    else:
+        assert payload["worker"]["heartbeat_age_seconds"] is None
+
+    if expected_note is None:
+        assert payload["notes"] == []
+    else:
+        assert any(
+            expected_note in str(note).lower() for note in payload["notes"]
+        )
+
+
+def test_health_chat_reports_queue_progression(monkeypatch):
+    fake_redis = _FakeRedisClient(queue_depth=0)
+    monkeypatch.setattr(
+        health_routes,
+        "_collect_completion_service_health",
+        _fresh_completion_service,
+    )
+    monkeypatch.setattr(
+        "guardian.queue.redis_queue.get_redis_client",
+        lambda: fake_redis,
+    )
+
+    client = TestClient(app)
+
+    def read_health():
+        response = client.get("/health/chat")
+        assert response.status_code == 200
+        return response.json()
+
+    initial = read_health()
+    assert initial["queue"]["depth"] == 0
+    assert initial["queue"]["status"] == "progressing"
+    assert initial["status"] == "healthy"
+    assert any("queue empty" in note.lower() for note in initial["notes"])
+
+    fake_redis.queue_depth = 6
+    growing = read_health()
+    assert growing["queue"]["depth"] == 6
+    assert growing["queue"]["status"] == "stalled"
+    assert growing["status"] == "degraded"
+    assert any("not progressing" in note.lower() for note in growing["notes"])
+
+    fake_redis.queue_depth = 4
+    draining = read_health()
+    assert draining["queue"]["depth"] == 4
+    assert draining["queue"]["status"] == "progressing"
+    assert draining["status"] == "healthy"
+    assert any("progressing" in note.lower() for note in draining["notes"])
+
+    fake_redis.queue_depth = 4
+    stuck = read_health()
+    assert stuck["queue"]["depth"] == 4
+    assert stuck["queue"]["status"] == "stalled"
+    assert stuck["status"] == "degraded"
+    assert any("not progressing" in note.lower() for note in stuck["notes"])
+
+    fake_redis.queue_depth = 30
+    high = read_health()
+    assert high["queue"]["depth"] == 30
+    assert high["queue"]["status"] == "stalled"
+    assert high["status"] == "unhealthy"
+    assert any("high" in note.lower() for note in high["notes"])
