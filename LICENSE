@@ -1,0 +1,165 @@
+Draft license text for project-owner review. Not legal advice. Do not treat as final until reviewed by qualified counsel.
+
+# Codexify Source Available License v0.1 (Draft)
+
+Copyright (c) 2025 Resonant Constructs LLC and the Codexify contributors, if
+any. All rights reserved.
+
+## 1. Preamble
+
+Codexify is being shared as source-available software so that people can inspect
+the code, learn from it, audit it, and run it locally for limited free-use
+purposes.
+
+This license is not an OSI-approved open source license and must not be
+described as "open source" in the strict legal sense unless the project owner
+later replaces this license with an OSI-approved license.
+
+This draft is intended to express the project owner's current release posture:
+local-first beta software, visible source, narrow proof-driven claims, and no
+unrestricted commercial exploitation.
+
+## 2. Definitions
+
+"Licensor" means Resonant Constructs LLC or the project owner that publishes
+Codexify under this license.
+
+"Software" means the Codexify source code, documentation, build scripts,
+configuration, and other materials distributed with this repository, excluding
+third-party components distributed under their own terms.
+
+"You" means the individual or legal entity exercising rights under this
+license.
+
+"Free Use" means personal, educational, hobbyist, research, evaluation, and
+local or private non-commercial use by an individual or a small private group
+where the Software is not used to generate revenue, support paid delivery, or
+operate production infrastructure for an organization.
+
+"Commercial Use" means any use of the Software that is connected to revenue,
+paid services, client work, internal company operations, organizational
+production systems, customer-facing delivery, or other business activity.
+
+"Hosted Service" means making the Software available to third parties over a
+network, including as a hosted application, API, managed service, shared
+instance, or software-as-a-service offering.
+
+"Marks" means the Codexify name, product names, logos, trade dress, branding,
+and other source-identifying terms or assets associated with the Software.
+
+## 3. Permitted Free Uses
+
+Subject to this license, You may for Free Use only:
+
+1. view, download, and run the Software;
+2. study, audit, benchmark, and evaluate the Software;
+3. modify the Software for Your own Free Use;
+4. share non-production forks or patches for discussion, learning, review, or
+   contribution, provided that You keep this license notice and do not imply
+   project-owner endorsement.
+
+The permitted free-use boundary is intended to allow local, private,
+non-commercial use, including personal experimentation and research, without
+granting unrestricted deployment rights.
+
+## 4. Commercial Use Requires a Separate Paid License
+
+You may not engage in Commercial Use of the Software unless You first obtain a
+separate written commercial license from the Licensor.
+
+Commercial Use requiring a separate paid license includes, without limitation:
+
+1. company or organizational production use;
+2. use as operational infrastructure for paid work or client delivery;
+3. customer-facing deployments;
+4. paid support, managed-service, or consulting offerings built on the
+   Software;
+5. embedding the Software into a paid product, subscription, or service;
+6. white-label, OEM, sublicensed, or resale distribution.
+
+## 5. SaaS / Hosted Service Restriction
+
+You may not use the Software to operate, power, expose, or support a Hosted
+Service for third parties without a separate written commercial license.
+
+This restriction applies whether the Hosted Service is public, private,
+customer-specific, internal to an organization, or otherwise accessible over a
+network for operational use beyond Free Use.
+
+## 6. Redistribution and Forks
+
+You may redistribute the unmodified Software or modified forks only for Free
+Use, review, education, research, or contribution-oriented purposes, and only
+if:
+
+1. this license and all copyright notices are preserved;
+2. recipients are informed that the Software is source-available, not OSI open
+   source;
+3. no Commercial Use rights are granted or implied;
+4. Your fork does not use the Marks or present itself as an official Codexify
+   release.
+
+Redistribution for sale, paid access, managed hosting, commercial support, or
+other Commercial Use requires a separate written commercial license.
+
+## 7. No Trademark License
+
+No trademark, trade name, logo, branding, or other Marks license is granted by
+this document.
+
+You may not use the Marks in connection with forks, derivative works,
+deployments, marketing, domain names, package names, service names, or product
+identity language without prior written permission from the Licensor.
+
+## 8. Contributions
+
+Contributor policy: TBD.
+
+Until a separate contributor policy or contribution agreement is published, the
+project owner should treat inbound contributions as subject to additional review
+before acceptance, and contributors should not assume that contribution rights,
+patent terms, or relicensing terms are fully settled by this draft alone.
+
+## 9. Third-Party Components
+
+Third-party software included with or referenced by the Software may be subject
+to separate license terms. This license applies only to the Licensor's rights
+in Codexify itself and does not replace or narrow obligations imposed by
+third-party licenses.
+
+## 10. Warranty Disclaimer
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE SOFTWARE IS PROVIDED "AS IS" AND
+"AS AVAILABLE", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, WHETHER EXPRESS,
+IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, SECURITY, OR
+AVAILABILITY.
+
+## 11. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE LICENSOR WILL NOT BE LIABLE FOR ANY
+INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, CONSEQUENTIAL, OR PUNITIVE DAMAGES,
+OR FOR ANY LOSS OF DATA, PROFITS, REVENUE, GOODWILL, OR BUSINESS INTERRUPTION,
+ARISING OUT OF OR RELATED TO THE SOFTWARE OR THIS LICENSE, EVEN IF ADVISED OF
+THE POSSIBILITY OF SUCH DAMAGES.
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE TOTAL LIABILITY OF THE LICENSOR FOR
+ANY CLAIM ARISING OUT OF OR RELATED TO THE SOFTWARE OR THIS LICENSE WILL NOT
+EXCEED ONE HUNDRED U.S. DOLLARS (USD $100).
+
+## 12. Termination
+
+This license terminates automatically if You breach it.
+
+Upon termination, You must stop using the Software under this license and
+destroy or stop distributing copies under Your control, except to the extent
+applicable law requires otherwise.
+
+The Licensor may offer reinstatement terms in writing, but no reinstatement is
+guaranteed by this draft.
+
+## 13. Legal Review Notice
+
+This is a draft license text for project-owner review. It is not legal advice,
+may contain gaps, and must not be treated as a final public license until it
+has been reviewed by qualified counsel and approved by the project owner.
